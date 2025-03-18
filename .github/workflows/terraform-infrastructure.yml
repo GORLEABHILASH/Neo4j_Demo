@@ -1,0 +1,152 @@
+name: Terraform Infrastructure Management
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-infrastructure.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+env:
+  AWS_REGION: us-west-2
+  TF_WORKSPACE: ${{ github.event.inputs.environment || 'dev' }}
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./terraform
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "~1.5.0"
+      
+      - name: Terraform Init
+        id: init
+        run: terraform init
+      
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -check
+        continue-on-error: true
+      
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate
+      
+      - name: Terraform Plan
+        id: plan
+        if: github.event_name == 'pull_request' || github.event.inputs.action == 'plan' || github.event.inputs.action == 'apply'
+        run: terraform plan -out=tfplan
+        continue-on-error: true
+      
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        env:
+          PLAN: "${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform
+            ${process.env.PLAN}
+            \`\`\`
+            
+            </details>`;
+              
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+      
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply'
+        run: terraform apply tfplan
+      
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy'
+        run: terraform destroy -auto-approve
+      
+      - name: Configure Infrastructure Parameters
+        if: github.event.inputs.action == 'apply'
+        run: |
+          # Set required parameters if they don't exist yet
+          echo "Setting up Parameter Store values..."
+          
+          # Domain name
+          aws ssm put-parameter \
+            --name "/neo4j-demos/${{ env.TF_WORKSPACE }}/domain-name" \
+            --value "neo4j-demos.example.com" \
+            --type String \
+            --overwrite
+          
+          # Neo4j version
+          aws ssm put-parameter \
+            --name "/neo4j-demos/${{ env.TF_WORKSPACE }}/neo4j-version" \
+            --value "4.4.14" \
+            --type String \
+            --overwrite
+          
+          # Generate random password for Neo4j if needed
+          if ! aws ssm get-parameter --name "/neo4j-demos/${{ env.TF_WORKSPACE }}/neo4j-password" &>/dev/null; then
+            RANDOM_PASSWORD=$(openssl rand -base64 16)
+            aws ssm put-parameter \
+              --name "/neo4j-demos/${{ env.TF_WORKSPACE }}/neo4j-password" \
+              --value "$RANDOM_PASSWORD" \
+              --type SecureString
+          fi
+          
+          # App replicas
+          aws ssm put-parameter \
+            --name "/neo4j-demos/${{ env.TF_WORKSPACE }}/app-replicas" \
+            --value "2" \
+            --type String \
+            --overwrite
+          
+          echo "Parameter Store setup complete!"
