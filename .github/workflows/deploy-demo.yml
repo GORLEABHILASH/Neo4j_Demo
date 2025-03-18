@@ -1,0 +1,175 @@
+name: Build and Deploy Neo4j Demo
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'demos/**'
+      - '.github/workflows/deploy-demo.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'demos/**'
+  workflow_dispatch:
+    inputs:
+      demo_name:
+        description: 'Demo application name to deploy'
+        required: true
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY_PREFIX: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed demos
+        id: set-matrix
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # If workflow dispatch, build only the specified demo
+            echo "matrix={\"demo\":[\""${{ github.event.inputs.demo_name }}"\"]}" >> $GITHUB_OUTPUT
+          else
+            # Get list of changed demos
+            CHANGED_DEMOS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep "^demos/" | cut -d/ -f2 | sort | uniq | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "matrix={\"demo\":$CHANGED_DEMOS}" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-push:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Set environment variables
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "DEPLOY_ENV=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+          else
+            # Default to dev environment for push/PR events
+            echo "DEPLOY_ENV=dev" >> $GITHUB_ENV
+          fi
+          echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
+          
+      - name: Build, tag, and push image
+        working-directory: demos/${{ matrix.demo }}
+        run: |
+          docker build -t ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.IMAGE_TAG }} .
+          docker push ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.IMAGE_TAG }}
+          
+          # Tag as latest for the specific environment
+          docker tag ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.IMAGE_TAG }} ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.DEPLOY_ENV }}-latest
+          docker push ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.DEPLOY_ENV }}-latest
+  
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Set environment variables
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "DEPLOY_ENV=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+          else
+            # Default to dev environment for push/PR events
+            echo "DEPLOY_ENV=dev" >> $GITHUB_ENV
+          fi
+          echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
+          
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name neo4j-demo-cluster --region ${{ env.AWS_REGION }}
+      
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.16.2/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+      
+      - name: Deploy Neo4j and demo app
+        working-directory: deployment
+        run: |
+          # Get domain name and other settings from parameter store
+          DOMAIN_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/domain-name" --query "Parameter.Value" --output text)
+          NEO4J_VERSION=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-version" --query "Parameter.Value" --output text)
+          NEO4J_PASSWORD=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-password" --with-decryption --query "Parameter.Value" --output text)
+          REPLICAS=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/app-replicas" --query "Parameter.Value" --output text)
+          
+          # Prepare Neo4j auth base64
+          NEO4J_AUTH_BASE64=$(echo -n "neo4j/${NEO4J_PASSWORD}" | base64)
+          
+          # Generate Neo4j config from template
+          sed -e "s/{{DEMO_NAME}}/${{ matrix.demo }}/g" \
+              -e "s/{{NEO4J_VERSION}}/${NEO4J_VERSION}/g" \
+              -e "s/{{NEO4J_AUTH_BASE64}}/${NEO4J_AUTH_BASE64}/g" \
+              neo4j-template.yaml > neo4j-${{ matrix.demo }}.yaml
+          
+          # Generate demo app config from template
+          sed -e "s/{{DEMO_NAME}}/${{ matrix.demo }}/g" \
+              -e "s/{{REPLICAS}}/${REPLICAS}/g" \
+              -e "s|{{ECR_REPO_URL}}|${{ env.ECR_REPOSITORY_PREFIX }}|g" \
+              -e "s/{{IMAGE_TAG}}/${{ env.IMAGE_TAG }}/g" \
+              -e "s/{{ENVIRONMENT}}/${{ env.DEPLOY_ENV }}/g" \
+              -e "s/{{DOMAIN_NAME}}/${DOMAIN_NAME}/g" \
+              demo-app-template.yaml > demo-app-${{ matrix.demo }}.yaml
+          
+          # Apply configurations
+          kubectl apply -f neo4j-${{ matrix.demo }}.yaml
+          kubectl apply -f demo-app-${{ matrix.demo }}.yaml
+          
+          # Update deployment record in DynamoDB
+          aws dynamodb put-item \
+            --table-name neo4j-demo-deployments \
+            --item '{
+              "demo_id": {"S": "${{ matrix.demo }}"},
+              "version": {"S": "${{ env.IMAGE_TAG }}"},
+              "environment": {"S": "${{ env.DEPLOY_ENV }}"},
+              "deployment_time": {"S": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"},
+              "deployed_by": {"S": "${{ github.actor }}"},
+              "commit_sha": {"S": "${{ github.sha }}"}
+            }'
+            
+      - name: Wait for deployment to complete
+        run: |
+          kubectl rollout status deployment/${{ matrix.demo }}-app -n ${{ matrix.demo }} --timeout=5m
