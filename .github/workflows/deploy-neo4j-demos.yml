@@ -191,9 +191,9 @@ jobs:
             namespace: {{DEMO_NAME}}
           data:
             neo4j.conf: |
-              dbms.memory.heap.initial_size=256m
-              dbms.memory.heap.max_size=512M
-              dbms.memory.pagecache.size=256M
+              dbms.memory.heap.initial_size=128m
+              dbms.memory.heap.max_size=256m
+              dbms.memory.pagecache.size=128m
               dbms.default_listen_address=0.0.0.0
               dbms.connector.bolt.listen_address=0.0.0.0:7687
               dbms.connector.http.listen_address=0.0.0.0:7474
@@ -201,6 +201,8 @@ jobs:
               dbms.security.auth_enabled=true
               dbms.directories.import=/var/lib/neo4j/import
               dbms.allow_upgrade=true
+              # Disable memory validation - environment has constraints Neo4j doesn't detect
+              dbms.memory.validation=false
           ---
           apiVersion: apps/v1
           kind: Deployment
