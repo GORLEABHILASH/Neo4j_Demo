@@ -1,0 +1,19 @@
+# Node modules
+node_modules/
+
+# Build directories
+dist/
+build/
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+logs/
+*.log
+
+# Other common exclusions
+.DS_Store
+.idea/
+.vscode/
