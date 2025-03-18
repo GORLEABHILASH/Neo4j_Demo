@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{DEMO_NAME}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: neo4j-conf
+  namespace: {{DEMO_NAME}}
+data:
+  neo4j.conf: |
+    dbms.memory.heap.initial_size=512m
+    dbms.memory.heap.max_size=2G
+    dbms.memory.pagecache.size=1G
+    dbms.default_listen_address=0.0.0.0
+    dbms.connector.bolt.listen_address=0.0.0.0:7687
+    dbms.connector.http.listen_address=0.0.0.0:7474
+    dbms.connector.https.listen_address=0.0.0.0:7473
+    dbms.security.auth_enabled=true
+    dbms.security.procedures.unrestricted=apoc.*
+    dbms.directories.import=/var/lib/neo4j/import
+    dbms.allow_upgrade=true
+    dbms.directories.plugins=/plugins
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: neo4j
+  namespace: {{DEMO_NAME}}
+spec:
+  serviceName: neo4j
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neo4j
+      demo: {{DEMO_NAME}}
+  template:
+    metadata:
+      labels:
+        app: neo4j
+        demo: {{DEMO_NAME}}
+    spec:
+      containers:
+      - name: neo4j
+        image: neo4j:{{NEO4J_VERSION}}
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 7474
+          name: http
+        - containerPort: 7687
+          name: bolt
+        env:
+        - name: NEO4J_AUTH
+          valueFrom:
+            secretKeyRef:
+              name: neo4j-secrets
+              key: neo4j-auth
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: conf
+          mountPath: /conf
+        - name: plugins
+          mountPath: /plugins
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+        livenessProbe:
+          tcpSocket:
+            port: 7474
+          initialDelaySeconds: 60
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 7474
+          initialDelaySeconds: 60
+          timeoutSeconds: 10
+      volumes:
+      - name: conf
+        configMap:
+          name: neo4j-conf
+      - name: plugins
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: gp2
+      resources:
+        requests:
+          storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j
+  namespace: {{DEMO_NAME}}
+spec:
+  selector:
+    app: neo4j
+    demo: {{DEMO_NAME}}
+  ports:
+  - name: http
+    port: 7474
+    targetPort: 7474
+  - name: bolt
+    port: 7687
+    targetPort: 7687
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: neo4j-secrets
+  namespace: {{DEMO_NAME}}
+type: Opaque
+data:
+  neo4j-auth: {{NEO4J_AUTH_BASE64}}
