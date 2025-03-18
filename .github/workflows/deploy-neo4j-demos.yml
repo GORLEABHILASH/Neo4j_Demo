@@ -428,7 +428,15 @@ jobs:
       
       - name: Deploy Neo4j
         run: |
-          # Apply Neo4j first
+          # Check if the StatefulSet already exists
+          if kubectl get statefulset neo4j -n ${{ matrix.demo }} &>/dev/null; then
+            echo "StatefulSet already exists. Deleting it first to allow changes..."
+            kubectl delete statefulset neo4j -n ${{ matrix.demo }} --cascade=orphan
+            echo "Waiting for StatefulSet to be deleted..."
+            kubectl wait --for=delete statefulset/neo4j -n ${{ matrix.demo }} --timeout=2m || true
+          fi
+          
+          # Apply Neo4j
           kubectl apply -f generated-manifests/neo4j-${{ matrix.demo }}.yaml
           
           # Debug - check Neo4j pod status
