@@ -233,11 +233,11 @@ jobs:
                     mountPath: /conf
                   resources:
                     requests:
-                      cpu: "0.2"
-                      memory: "512Mi"
+                      cpu: "0.1"
+                      memory: "256Mi"
                     limits:
-                      cpu: "1"
-                      memory: "1Gi"
+                      cpu: "0.5"
+                      memory: "512Mi"
                   livenessProbe:
                     tcpSocket:
                       port: 7687
@@ -254,15 +254,8 @@ jobs:
                 - name: conf
                   configMap:
                     name: neo4j-conf
-            volumeClaimTemplates:
-            - metadata:
-                name: data
-              spec:
-                accessModes: [ "ReadWriteOnce" ]
-                storageClassName: gp2
-                resources:
-                  requests:
-                    storage: 5Gi
+                - name: data
+                  emptyDir: {}  # Using emptyDir instead of PVC for testing
           ---
           apiVersion: v1
           kind: Service
@@ -290,6 +283,7 @@ jobs:
           type: Opaque
           data:
             neo4j-auth: {{NEO4J_AUTH_BASE64}}
+            neo4j-password: {{NEO4J_PASSWORD_BASE64}}
           EOFNEO
       
       - name: Create Demo App template
@@ -398,8 +392,9 @@ jobs:
           NEO4J_PASSWORD=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-password" --with-decryption --query "Parameter.Value" --output text || echo "password")
           REPLICAS=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/app-replicas" --query "Parameter.Value" --output text || echo "1")
           
-          # Prepare Neo4j auth base64
+          # Prepare Neo4j auth and password base64
           NEO4J_AUTH_BASE64=$(echo -n "neo4j/${NEO4J_PASSWORD}" | base64 -w 0)
+          NEO4J_PASSWORD_BASE64=$(echo -n "${NEO4J_PASSWORD}" | base64 -w 0)
           
           # Create namespace if it doesn't exist
           kubectl create namespace ${{ matrix.demo }} --dry-run=client -o yaml | kubectl apply -f -
@@ -408,7 +403,8 @@ jobs:
           cat deployment/neo4j-template.yaml | \
           sed "s/{{DEMO_NAME}}/${{ matrix.demo }}/g" | \
           sed "s/{{NEO4J_VERSION}}/${NEO4J_VERSION}/g" | \
-          sed "s/{{NEO4J_AUTH_BASE64}}/${NEO4J_AUTH_BASE64}/g" > generated-manifests/neo4j-${{ matrix.demo }}.yaml
+          sed "s/{{NEO4J_AUTH_BASE64}}/${NEO4J_AUTH_BASE64}/g" | \
+          sed "s/{{NEO4J_PASSWORD_BASE64}}/${NEO4J_PASSWORD_BASE64}/g" > generated-manifests/neo4j-${{ matrix.demo }}.yaml
           
           # Process demo app template
           cat deployment/demo-app-template.yaml | \
