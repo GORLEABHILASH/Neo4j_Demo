@@ -30,12 +30,6 @@ on:
         default: false
         type: boolean
 
-env:
-  AWS_REGION: us-west-2
-  ECR_REPOSITORY_PREFIX: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-  CLUSTER_NAME: neo4j-demo-cluster
-  TF_WORKSPACE: ${{ github.event.inputs.environment || 'dev' }}
-
 jobs:
   determine-demos:
     runs-on: ubuntu-latest
@@ -78,6 +72,8 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.determine-demos.outputs.matrix) }}
       fail-fast: false
+    env:
+      AWS_REGION: us-west-2
     
     steps:
       - name: Checkout code
@@ -114,6 +110,7 @@ jobs:
           DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
           echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
           echo "IMAGE_TAG=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY_PREFIX=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_ENV
           
       - name: Build, tag, and push image
         working-directory: demos/${{ matrix.demo }}
@@ -132,6 +129,9 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.determine-demos.outputs.matrix) }}
       fail-fast: false
+    env:
+      AWS_REGION: us-west-2
+      CLUSTER_NAME: neo4j-demo-cluster
     
     steps:
       - name: Checkout code
@@ -149,6 +149,7 @@ jobs:
           DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
           echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
           echo "IMAGE_TAG=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY_PREFIX=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_ENV
           
       - name: Update kubeconfig
         run: |
