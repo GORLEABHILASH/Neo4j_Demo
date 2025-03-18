@@ -1,20 +1,20 @@
-name: Build and Deploy Neo4j Demo
+name: Build and Deploy Neo4j Demos
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
       - 'demos/**'
-      - '.github/workflows/deploy-demo.yml'
+      - '.github/workflows/deploy-neo4j-demos.yml'
   pull_request:
-    branches: [ main ]
+    branches: [main]
     paths:
       - 'demos/**'
   workflow_dispatch:
     inputs:
       demo_name:
-        description: 'Demo application name to deploy'
-        required: true
+        description: 'Demo application name to deploy (leave empty for all demos)'
+        required: false
       environment:
         description: 'Environment to deploy to'
         required: true
@@ -24,45 +24,82 @@ on:
           - dev
           - staging
           - prod
+      deploy_all:
+        description: 'Deploy all demos'
+        required: false
+        default: false
+        type: boolean
 
 env:
   AWS_REGION: us-west-2
   ECR_REPOSITORY_PREFIX: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+  CLUSTER_NAME: neo4j-demo-cluster
+  TF_WORKSPACE: ${{ github.event.inputs.environment || 'dev' }}
 
 jobs:
-  detect-changes:
+  determine-demos:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v2
+      - name: Checkout code
+        uses: actions/checkout@v3
         with:
           fetch-depth: 0
-
-      - name: Detect changed demos
+      
+      - name: Determine demos to deploy
         id: set-matrix
         run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # If workflow dispatch, build only the specified demo
-            echo "matrix={\"demo\":[\""${{ github.event.inputs.demo_name }}"\"]}" >> $GITHUB_OUTPUT
-          else
-            # Get list of changed demos
-            CHANGED_DEMOS=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep "^demos/" | cut -d/ -f2 | sort | uniq | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          if [[ "${{ github.event.inputs.deploy_all }}" == "true" ]]; then
+            # Deploy all demos
+            DEMOS=$(ls -1 demos/ | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "matrix={\"demo\":$DEMOS}" >> $GITHUB_OUTPUT
+          elif [[ -n "${{ github.event.inputs.demo_name }}" ]]; then
+            # Deploy specified demo
+            echo "matrix={\"demo\":[\"${{ github.event.inputs.demo_name }}\"]}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "pull_request" ]]; then
+            # Find changed demos
+            BEFORE_SHA=${{ github.event.before || 'HEAD~1' }}
+            CURRENT_SHA=${{ github.sha }}
+            CHANGED_DEMOS=$(git diff --name-only $BEFORE_SHA $CURRENT_SHA | grep "^demos/" | cut -d/ -f2 | sort | uniq | jq -R -s -c 'split("\n") | map(select(length > 0))')
             echo "matrix={\"demo\":$CHANGED_DEMOS}" >> $GITHUB_OUTPUT
+          else
+            # Default to empty if somehow nothing is selected
+            echo "matrix={\"demo\":[]}" >> $GITHUB_OUTPUT
           fi
+          
+          # Output the demos for logs
+          echo "Demos to deploy: $(echo $matrix | jq -c '.demo')"
 
   build-and-push:
-    needs: detect-changes
+    needs: determine-demos
+    if: ${{ fromJson(needs.determine-demos.outputs.matrix).demo[0] != null }}
     runs-on: ubuntu-latest
     strategy:
-      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.determine-demos.outputs.matrix) }}
+      fail-fast: false
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'demos/${{ matrix.demo }}/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: demos/${{ matrix.demo }}
+        run: npm ci
+      
+      - name: Build application
+        working-directory: demos/${{ matrix.demo }}
+        run: npm run build
+      
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -72,15 +109,11 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
       
-      - name: Set environment variables
+      - name: Set environment & tag
         run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "DEPLOY_ENV=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
-          else
-            # Default to dev environment for push/PR events
-            echo "DEPLOY_ENV=dev" >> $GITHUB_ENV
-          fi
-          echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
+          DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
+          echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
           
       - name: Build, tag, and push image
         working-directory: demos/${{ matrix.demo }}
@@ -93,16 +126,19 @@ jobs:
           docker push ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.DEPLOY_ENV }}-latest
   
   deploy:
-    needs: build-and-push
+    needs: [determine-demos, build-and-push]
+    if: ${{ fromJson(needs.determine-demos.outputs.matrix).demo[0] != null }}
     runs-on: ubuntu-latest
     strategy:
-      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.determine-demos.outputs.matrix) }}
+      fail-fast: false
+    
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -110,53 +146,62 @@ jobs:
       
       - name: Set environment variables
         run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "DEPLOY_ENV=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
-          else
-            # Default to dev environment for push/PR events
-            echo "DEPLOY_ENV=dev" >> $GITHUB_ENV
-          fi
-          echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
+          DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
+          echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
           
       - name: Update kubeconfig
         run: |
-          aws eks update-kubeconfig --name neo4j-demo-cluster --region ${{ env.AWS_REGION }}
+          aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
       
-      - name: Install yq
+      - name: Install yq for YAML processing
         run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.16.2/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+          wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.30.8/yq_linux_amd64
+          chmod +x /usr/local/bin/yq
       
-      - name: Deploy Neo4j and demo app
-        working-directory: deployment
+      - name: Generate Kubernetes manifests
         run: |
-          # Get domain name and other settings from parameter store
+          # Get configuration from parameter store
           DOMAIN_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/domain-name" --query "Parameter.Value" --output text)
           NEO4J_VERSION=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-version" --query "Parameter.Value" --output text)
           NEO4J_PASSWORD=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-password" --with-decryption --query "Parameter.Value" --output text)
           REPLICAS=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/app-replicas" --query "Parameter.Value" --output text)
           
           # Prepare Neo4j auth base64
-          NEO4J_AUTH_BASE64=$(echo -n "neo4j/${NEO4J_PASSWORD}" | base64)
+          NEO4J_AUTH_BASE64=$(echo -n "neo4j/${NEO4J_PASSWORD}" | base64 -w 0)
           
-          # Generate Neo4j config from template
-          sed -e "s/{{DEMO_NAME}}/${{ matrix.demo }}/g" \
-              -e "s/{{NEO4J_VERSION}}/${NEO4J_VERSION}/g" \
-              -e "s/{{NEO4J_AUTH_BASE64}}/${NEO4J_AUTH_BASE64}/g" \
-              neo4j-template.yaml > neo4j-${{ matrix.demo }}.yaml
+          # Create namespace if it doesn't exist
+          kubectl create namespace ${{ matrix.demo }} --dry-run=client -o yaml | kubectl apply -f -
           
-          # Generate demo app config from template
-          sed -e "s/{{DEMO_NAME}}/${{ matrix.demo }}/g" \
-              -e "s/{{REPLICAS}}/${REPLICAS}/g" \
-              -e "s|{{ECR_REPO_URL}}|${{ env.ECR_REPOSITORY_PREFIX }}|g" \
-              -e "s/{{IMAGE_TAG}}/${{ env.IMAGE_TAG }}/g" \
-              -e "s/{{ENVIRONMENT}}/${{ env.DEPLOY_ENV }}/g" \
-              -e "s/{{DOMAIN_NAME}}/${DOMAIN_NAME}/g" \
-              demo-app-template.yaml > demo-app-${{ matrix.demo }}.yaml
+          # Generate manifest directory
+          mkdir -p generated-manifests
           
-          # Apply configurations
-          kubectl apply -f neo4j-${{ matrix.demo }}.yaml
-          kubectl apply -f demo-app-${{ matrix.demo }}.yaml
+          # Process Neo4j template
+          cat deployment/neo4j-template.yaml | \
+          sed "s/{{DEMO_NAME}}/${{ matrix.demo }}/g" | \
+          sed "s/{{NEO4J_VERSION}}/${NEO4J_VERSION}/g" | \
+          sed "s/{{NEO4J_AUTH_BASE64}}/${NEO4J_AUTH_BASE64}/g" > generated-manifests/neo4j-${{ matrix.demo }}.yaml
+          
+          # Process demo app template
+          cat deployment/demo-app-template.yaml | \
+          sed "s/{{DEMO_NAME}}/${{ matrix.demo }}/g" | \
+          sed "s/{{REPLICAS}}/${REPLICAS}/g" | \
+          sed "s|{{ECR_REPO_URL}}|${{ env.ECR_REPOSITORY_PREFIX }}|g" | \
+          sed "s/{{IMAGE_TAG}}/${{ env.IMAGE_TAG }}/g" | \
+          sed "s/{{ENVIRONMENT}}/${{ env.DEPLOY_ENV }}/g" | \
+          sed "s/{{DOMAIN_NAME}}/${DOMAIN_NAME}/g" > generated-manifests/app-${{ matrix.demo }}.yaml
+      
+      - name: Deploy to Kubernetes
+        run: |
+          # Apply Neo4j first
+          kubectl apply -f generated-manifests/neo4j-${{ matrix.demo }}.yaml
+          
+          # Wait for Neo4j to be ready before deploying the app
+          echo "Waiting for Neo4j to start..."
+          kubectl rollout status statefulset/neo4j -n ${{ matrix.demo }} --timeout=5m
+          
+          # Apply demo app
+          kubectl apply -f generated-manifests/app-${{ matrix.demo }}.yaml
           
           # Update deployment record in DynamoDB
           aws dynamodb put-item \
@@ -169,7 +214,15 @@ jobs:
               "deployed_by": {"S": "${{ github.actor }}"},
               "commit_sha": {"S": "${{ github.sha }}"}
             }'
-            
-      - name: Wait for deployment to complete
+      
+      - name: Verify deployment
         run: |
+          echo "Waiting for application deployment to complete..."
           kubectl rollout status deployment/${{ matrix.demo }}-app -n ${{ matrix.demo }} --timeout=5m
+          
+          DOMAIN_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/domain-name" --query "Parameter.Value" --output text)
+          echo "Deployment successful! Application should be available at: https://${{ matrix.demo }}.$DOMAIN_NAME"
+          
+          # Get service endpoints for logs
+          echo "Service endpoints:"
+          kubectl get ingress -n ${{ matrix.demo }} -o wide
