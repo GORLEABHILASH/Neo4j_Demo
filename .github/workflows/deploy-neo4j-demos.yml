@@ -129,6 +129,10 @@ jobs:
           # Tag as latest for the specific environment
           docker tag ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.IMAGE_TAG }} ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.DEPLOY_ENV }}-latest
           docker push ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.DEPLOY_ENV }}-latest
+          
+          # Also tag as just 'latest' for simplicity
+          docker tag ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.IMAGE_TAG }} ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:latest
+          docker push ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:latest
   
   deploy:
     needs: [determine-demos, build-and-push]
@@ -300,13 +304,15 @@ jobs:
       
       - name: Create Demo App template
         run: |
-          # Creating the Demo App template file
+          # Creating the Demo App template file with latest tag and imagePullPolicy Always
           cat > deployment/demo-app-template.yaml << 'EOFAPP'
           apiVersion: apps/v1
           kind: Deployment
           metadata:
             name: {{DEMO_NAME}}-app
             namespace: {{DEMO_NAME}}
+            annotations:
+              kubernetes.io/change-cause: "Build {{BUILD_ID}} deployed at {{DEPLOY_TIME}}"
           spec:
             replicas: {{REPLICAS}}
             selector:
@@ -316,10 +322,11 @@ jobs:
               metadata:
                 labels:
                   app: {{DEMO_NAME}}-app
+                  build-id: "{{BUILD_ID}}"
               spec:
                 containers:
                 - name: {{DEMO_NAME}}-app
-                  image: {{ECR_REPO_URL}}/{{DEMO_NAME}}:{{IMAGE_TAG}}
+                  image: {{ECR_REPO_URL}}/{{DEMO_NAME}}:latest
                   imagePullPolicy: Always
                   ports:
                   - containerPort: 8080
@@ -336,6 +343,8 @@ jobs:
                         key: neo4j-password
                   - name: DEMO_ENV
                     value: {{ENVIRONMENT}}
+                  - name: BUILD_ID
+                    value: "{{BUILD_ID}}"
                   resources:
                     requests:
                       cpu: "0.1"
@@ -408,6 +417,9 @@ jobs:
           NEO4J_AUTH_BASE64=$(echo -n "neo4j/${NEO4J_PASSWORD}" | base64 -w 0)
           NEO4J_PASSWORD_BASE64=$(echo -n "${NEO4J_PASSWORD}" | base64 -w 0)
           
+          # Current timestamp for deployment annotation
+          DEPLOY_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          
           # Create or clean namespace
           kubectl get namespace ${{ matrix.demo }} || kubectl create namespace ${{ matrix.demo }}
           
@@ -423,16 +435,14 @@ jobs:
           sed "s/{{DEMO_NAME}}/${{ matrix.demo }}/g" | \
           sed "s/{{REPLICAS}}/${REPLICAS}/g" | \
           sed "s|{{ECR_REPO_URL}}|${{ env.ECR_REPOSITORY_PREFIX }}|g" | \
-          sed "s/{{IMAGE_TAG}}/${{ env.IMAGE_TAG }}/g" | \
+          sed "s/{{BUILD_ID}}/${{ env.IMAGE_TAG }}/g" | \
+          sed "s/{{DEPLOY_TIME}}/${DEPLOY_TIME}/g" | \
           sed "s/{{ENVIRONMENT}}/${{ env.DEPLOY_ENV }}/g" | \
           sed "s/{{DOMAIN_NAME}}/${DOMAIN_NAME}/g" > generated-manifests/app-${{ matrix.demo }}.yaml
           
           # Debug - Print important parts of the manifest for verification
-          echo "Verifying Neo4j template has emptyDir volume:"
-          grep -A 5 "volumes:" generated-manifests/neo4j-${{ matrix.demo }}.yaml
-          
-          echo "Verifying Neo4j resource requirements:"
-          grep -A 6 "resources:" generated-manifests/neo4j-${{ matrix.demo }}.yaml
+          echo "Verifying app image and pull policy:"
+          grep -A 5 "image:" generated-manifests/app-${{ matrix.demo }}.yaml
       
       - name: Clean up existing resources
         run: |
