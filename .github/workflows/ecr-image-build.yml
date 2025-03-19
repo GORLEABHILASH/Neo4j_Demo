@@ -3,6 +3,17 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:  # Allow manual triggering
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -11,7 +22,7 @@ jobs:
         app_name: ["neo4j-movie-recommendation"]  # Replace with your demo app names
         include:
           - app_name: "neo4j-movie-recommendation"
-            dockerfile_path: "neo4j-movie-recommendation"  # Remove leading './'
+            dockerfile_path: "neo4j-movie-recommendation"
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -27,20 +38,50 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
       
+    - name: Set environment & build ID
+      run: |
+        DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
+        echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
+        echo "BUILD_ID=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
+      
     - name: Build, tag, and push image to Amazon ECR
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         ECR_REPOSITORY: ${{ matrix.app_name }}
-        IMAGE_TAG: latest
       run: |
         cd demos/${{ matrix.dockerfile_path }}
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
         
-        # Update the SSM parameter with the image version
-        # Modify parameter name to avoid 'ssm' prefix
+        # Make sure repository exists
+        aws ecr describe-repositories --repository-names ${{ matrix.app_name }} || aws ecr create-repository --repository-name ${{ matrix.app_name }}
+        
+        # Build with unique build ID
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }} .
+        
+        # Tag with latest
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }} $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        
+        # Tag with environment-specific latest 
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }} $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.DEPLOY_ENV }}-latest
+        
+        # Push all tags
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }}
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.DEPLOY_ENV }}-latest
+        
+        # Update the SSM parameters with the image version information
         aws ssm put-parameter \
-          --name "/neo4j-demos-${{ secrets.ENVIRONMENT }}/${{ matrix.app_name }}-image-tag" \
-          --value "$IMAGE_TAG" \
+          --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/${{ matrix.app_name }}-image-tag" \
+          --value "${{ env.BUILD_ID }}" \
           --type String \
           --overwrite
+        
+        aws ssm put-parameter \
+          --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/${{ matrix.app_name }}-last-updated" \
+          --value "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+          --type String \
+          --overwrite
+        
+        echo "Image $ECR_REGISTRY/$ECR_REPOSITORY has been tagged with:"
+        echo "- ${{ env.BUILD_ID }} (specific build)"
+        echo "- latest (latest overall)"
+        echo "- ${{ env.DEPLOY_ENV }}-latest (latest for ${{ env.DEPLOY_ENV }} environment)"
