@@ -1,10 +1,8 @@
 name: Build and Push ECR Images
-
 on:
   push:
     branches: [ main ]
   workflow_dispatch:  # Allow manual triggering
-
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -14,7 +12,6 @@ jobs:
         include:
           - app_name: "neo4j-movie-recommendation"
             dockerfile_path: "neo4j-movie-recommendation"  # Remove leading './'
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
@@ -39,11 +36,11 @@ jobs:
         cd demos/${{ matrix.dockerfile_path }}
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
         
         # Update the SSM parameter with the image version
+        # Modify parameter name to avoid 'ssm' prefix
         aws ssm put-parameter \
-          --name "/neo4j-demos/${{ secrets.ENVIRONMENT }}/${{ matrix.app_name }}-image-tag" \
+          --name "/neo4j-demos-${{ secrets.ENVIRONMENT }}/${{ matrix.app_name }}-image-tag" \
           --value "$IMAGE_TAG" \
           --type String \
           --overwrite
