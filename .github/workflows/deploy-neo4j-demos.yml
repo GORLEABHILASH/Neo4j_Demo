@@ -329,27 +329,28 @@ jobs:
           metadata:
             name: neo4j-conf
             namespace: {{DEMO_NAME}}
-            data:
-              neo4j.conf: |
-                # Updated memory settings
-                server.memory.heap.initial_size=64m
-                server.memory.heap.max_size=128m
-                server.memory.pagecache.size=64m
-                
-                # Updated server settings with correct naming convention
-                server.default_listen_address=0.0.0.0
-                server.bolt.listen_address=0.0.0.0:7687
-                server.http.listen_address=0.0.0.0:7474
-                server.https.listen_address=0.0.0.0:7473
-                
-                # Security settings
-                dbms.security.auth_enabled=true
-                
-                # Updated import directory setting
-                server.directories.import=/var/lib/neo4j/import
-                
-                # Configuration validation
-                server.config.strict_validation.enabled=false
+          data:
+            neo4j.conf: |
+              # Updated memory settings
+              server.memory.heap.initial_size=64m
+              server.memory.heap.max_size=128m
+              server.memory.pagecache.size=64m
+              
+              # Updated server settings with correct naming convention
+              server.default_listen_address=0.0.0.0
+              server.bolt.listen_address=0.0.0.0:7687
+              server.http.listen_address=0.0.0.0:7474
+              server.https.listen_address=0.0.0.0:7473
+              
+              # Security settings
+              dbms.security.auth_enabled=true
+              
+              # Updated import directory setting
+              server.directories.import=/var/lib/neo4j/import
+              
+              # Configuration validation
+              server.config.strict_validation.enabled=false
+         
           ---
           apiVersion: apps/v1
           kind: Deployment
