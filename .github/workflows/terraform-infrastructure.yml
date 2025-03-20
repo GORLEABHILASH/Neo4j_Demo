@@ -1,5 +1,4 @@
 name: Terraform Infrastructure Deployment
-
 on:
   push:
     paths:
@@ -9,34 +8,41 @@ on:
     workflows: ["Terraform Bootstrap"]
     types:
       - completed
-
 jobs:
   terraform:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
-
+        
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
-
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-west-2' }}
+          
       - name: Fetch Terraform Backend Details
         run: |
-          export TF_STATE_BUCKET=$(aws ssm get-parameter --name "/terraform/state_bucket" --query "Parameter.Value" --output text)
-          export TF_LOCK_TABLE=$(aws ssm get-parameter --name "/terraform/lock_table" --query "Parameter.Value" --output text)
-
+          TF_STATE_BUCKET=$(aws ssm get-parameter --name "/terraform/dev/state_bucket" --query "Parameter.Value" --output text)
+          TF_LOCK_TABLE=$(aws ssm get-parameter --name "/terraform/dev/lock_table" --query "Parameter.Value" --output text)
+          
+          echo "Retrieved backend details:"
+          echo "  - Bucket: $TF_STATE_BUCKET"
+          echo "  - Table: $TF_LOCK_TABLE"
+          
           echo "TF_STATE_BUCKET=$TF_STATE_BUCKET" >> $GITHUB_ENV
           echo "TF_LOCK_TABLE=$TF_LOCK_TABLE" >> $GITHUB_ENV
-
+          
       - name: Terraform Init
         working-directory: Terraform
         run: |
           terraform init \
             -backend-config="bucket=$TF_STATE_BUCKET" \
             -backend-config="key=terraform.tfstate" \
-            -backend-config="dynamodb_table=$TF_LOCK_TABLE"
-
+            -backend-config="dynamodb_table=$TF_LOCK_TABLE" \
+            -backend-config="region=${{ secrets.AWS_REGION || 'us-west-2' }}"
+            
       - name: Terraform Apply
         working-directory: Terraform
         run: terraform apply -auto-approve
