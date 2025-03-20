@@ -23,20 +23,76 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
 
-      - name: Terraform Init & Apply
+      - name: Check Existing Resources
+        id: check_resources
+        run: |
+          # Check if the resources already exist in AWS
+          BUCKET_EXISTS=$(aws s3api head-bucket --bucket $(grep -o 'bucket = "[^"]*"' bootstrap/main.tf | cut -d'"' -f2) 2>&1 || echo "not_exists")
+          TABLE_EXISTS=$(aws dynamodb describe-table --table-name $(grep -o 'name = "[^"]*"' bootstrap/main.tf | head -1 | cut -d'"' -f2) 2>&1 || echo "not_exists")
+          
+          # Set outputs based on existence check
+          if [[ "$BUCKET_EXISTS" != *"not_exists"* ]]; then
+            echo "bucket_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "bucket_exists=false" >> $GITHUB_OUTPUT
+          fi
+          
+          if [[ "$TABLE_EXISTS" != *"not_exists"* ]]; then
+            echo "table_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "table_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Terraform Init
+        working-directory: bootstrap
+        run: terraform init
+
+      - name: Terraform Import Resources (if they exist)
+        working-directory: bootstrap
+        if: steps.check_resources.outputs.bucket_exists == 'true' || steps.check_resources.outputs.table_exists == 'true'
+        run: |
+          # Get resource names from terraform files
+          BUCKET_NAME=$(grep -o 'bucket = "[^"]*"' main.tf | cut -d'"' -f2)
+          TABLE_NAME=$(grep -o 'name = "[^"]*"' main.tf | head -1 | cut -d'"' -f2)
+          
+          # Import existing S3 bucket if it exists
+          if [[ "${{ steps.check_resources.outputs.bucket_exists }}" == "true" ]]; then
+            echo "Importing existing S3 bucket: $BUCKET_NAME"
+            terraform import aws_s3_bucket.terraform_state $BUCKET_NAME || true
+          fi
+          
+          # Import existing DynamoDB table if it exists
+          if [[ "${{ steps.check_resources.outputs.table_exists }}" == "true" ]]; then
+            echo "Importing existing DynamoDB table: $TABLE_NAME"
+            terraform import aws_dynamodb_table.terraform_locks $TABLE_NAME || true
+          fi
+
+      - name: Terraform Apply
         working-directory: bootstrap
         run: |
-          terraform init
           terraform apply -auto-approve
-
-          # Extract backend values and store in GitHub environment or SSM
+          
+          # Extract backend values and store in GitHub environment
           BUCKET_NAME=$(terraform output -raw state_bucket_name)
           TABLE_NAME=$(terraform output -raw dynamodb_table_name)
-
+          
+          # Store single-line variables
           echo "TF_STATE_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
           echo "TF_LOCK_TABLE=$TABLE_NAME" >> $GITHUB_ENV
+          
+          # Store terraform output as multi-line variable
+          echo "TERRAFORM_OUTPUTS<<EOF" >> $GITHUB_ENV
+          terraform output -json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
       - name: Store Outputs in SSM
         run: |
           aws ssm put-parameter --name "/terraform/state_bucket" --value "$TF_STATE_BUCKET" --type "String" --overwrite
           aws ssm put-parameter --name "/terraform/lock_table" --value "$TF_LOCK_TABLE" --type "String" --overwrite
+          
+      - name: Log Terraform Outputs
+        run: |
+          echo "Terraform State Bucket: ${{ env.TF_STATE_BUCKET }}"
+          echo "Terraform Lock Table: ${{ env.TF_LOCK_TABLE }}"
+          echo "Full Terraform Outputs:"
+          echo "${{ env.TERRAFORM_OUTPUTS }}"
