@@ -35,32 +35,86 @@ jobs:
         with:
           terraform_version: 1.5.7
 
+      - name: Determine Resource Names
+        id: resource_names
+        working-directory: bootstrap
+        run: |
+          # Extract expected resource names
+          echo "bucket_name=neo4j-demos-terraform-state-dev" >> $GITHUB_OUTPUT
+          echo "table_name=neo4j-demos-terraform-locks-dev" >> $GITHUB_OUTPUT
+
+      - name: Check for Existing Resources
+        id: check_resources
+        run: |
+          BUCKET_NAME="${{ steps.resource_names.outputs.bucket_name }}"
+          TABLE_NAME="${{ steps.resource_names.outputs.table_name }}"
+          
+          # Check if resources already exist
+          aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null && \
+            echo "bucket_exists=true" >> $GITHUB_OUTPUT || \
+            echo "bucket_exists=false" >> $GITHUB_OUTPUT
+            
+          aws dynamodb describe-table --table-name "$TABLE_NAME" 2>/dev/null && \
+            echo "table_exists=true" >> $GITHUB_OUTPUT || \
+            echo "table_exists=false" >> $GITHUB_OUTPUT
+
+      - name: Clean Up Existing Resources
+        if: steps.check_resources.outputs.bucket_exists == 'true' || steps.check_resources.outputs.table_exists == 'true'
+        run: |
+          BUCKET_NAME="${{ steps.resource_names.outputs.bucket_name }}"
+          TABLE_NAME="${{ steps.resource_names.outputs.table_name }}"
+          
+          echo "Found existing resources. Cleaning up before recreation..."
+          
+          # Delete S3 bucket if it exists
+          if [[ "${{ steps.check_resources.outputs.bucket_exists }}" == "true" ]]; then
+            echo "Emptying and deleting S3 bucket: $BUCKET_NAME"
+            aws s3 rm s3://$BUCKET_NAME --recursive
+            aws s3api delete-bucket --bucket $BUCKET_NAME
+          fi
+          
+          # Delete DynamoDB table if it exists
+          if [[ "${{ steps.check_resources.outputs.table_exists }}" == "true" ]]; then
+            echo "Deleting DynamoDB table: $TABLE_NAME"
+            aws dynamodb delete-table --table-name $TABLE_NAME
+            # Wait for deletion to complete
+            echo "Waiting for table deletion to complete..."
+            aws dynamodb wait table-not-exists --table-name $TABLE_NAME
+          fi
+          
+          echo "Cleanup completed"
+
       - name: Terraform Init
         working-directory: bootstrap
         run: terraform init
-
-      - name: Terraform Plan
-        id: plan
-        working-directory: bootstrap
-        run: terraform plan -out=tfplan
 
       - name: Terraform Apply
         id: apply
         working-directory: bootstrap
         run: |
+          # Apply terraform configuration
           terraform apply -auto-approve
           
-          # Properly capture the outputs - this is the key fix
-          BUCKET_NAME=$(terraform output -raw state_bucket_name || echo "")
-          TABLE_NAME=$(terraform output -raw dynamodb_table_name || echo "")
+          # Using the temporary file approach to capture outputs
+          echo "Capturing Terraform outputs to file..."
+          terraform output -json > outputs.json
           
-          # Verify values were properly obtained
+          # Parse the outputs file using jq
+          BUCKET_NAME=$(jq -r '.state_bucket_name.value' outputs.json)
+          TABLE_NAME=$(jq -r '.dynamodb_table_name.value' outputs.json)
+          
+          # Verify the outputs were properly obtained
           echo "Captured bucket name: $BUCKET_NAME"
           echo "Captured table name: $TABLE_NAME"
           
-          # Use correct format for GITHUB_ENV
-          echo "TF_STATE_BUCKET=${BUCKET_NAME}" >> $GITHUB_ENV
-          echo "TF_LOCK_TABLE=${TABLE_NAME}" >> $GITHUB_ENV
+          # Store in GitHub environment variables
+          echo "TF_STATE_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
+          echo "TF_LOCK_TABLE=$TABLE_NAME" >> $GITHUB_ENV
+          
+          # Store the full outputs as a multi-line variable
+          echo "TERRAFORM_OUTPUTS<<EOF" >> $GITHUB_ENV
+          cat outputs.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
       - name: Store Outputs in SSM
         run: |
@@ -68,17 +122,25 @@ jobs:
           echo "Using bucket name: $TF_STATE_BUCKET"
           echo "Using table name: $TF_LOCK_TABLE"
           
-          # Store in SSM if values are not empty
-          if [[ -n "$TF_STATE_BUCKET" ]]; then
-            aws ssm put-parameter --name "/terraform/state_bucket" --value "$TF_STATE_BUCKET" --type "String" --overwrite
-            echo "Stored bucket name in SSM"
-          else
-            echo "Warning: Empty bucket name, not storing in SSM"
-          fi
+          # Store in SSM
+          aws ssm put-parameter --name "/terraform/state_bucket" --value "$TF_STATE_BUCKET" --type "String" --overwrite
+          aws ssm put-parameter --name "/terraform/lock_table" --value "$TF_LOCK_TABLE" --type "String" --overwrite
           
-          if [[ -n "$TF_LOCK_TABLE" ]]; then
-            aws ssm put-parameter --name "/terraform/lock_table" --value "$TF_LOCK_TABLE" --type "String" --overwrite
-            echo "Stored table name in SSM"
+          echo "Successfully stored Terraform outputs in SSM Parameter Store"
+
+      - name: Verify SSM Parameters
+        run: |
+          echo "Verifying SSM parameters were set correctly:"
+          
+          BUCKET_SSM=$(aws ssm get-parameter --name "/terraform/state_bucket" --query "Parameter.Value" --output text)
+          TABLE_SSM=$(aws ssm get-parameter --name "/terraform/lock_table" --query "Parameter.Value" --output text)
+          
+          echo "SSM /terraform/state_bucket: $BUCKET_SSM"
+          echo "SSM /terraform/lock_table: $TABLE_SSM"
+          
+          if [[ "$BUCKET_SSM" == "$TF_STATE_BUCKET" && "$TABLE_SSM" == "$TF_LOCK_TABLE" ]]; then
+            echo "✅ SSM parameters verified successfully"
           else
-            echo "Warning: Empty table name, not storing in SSM"
+            echo "❌ SSM parameters do not match expected values"
+            exit 1
           fi
