@@ -38,7 +38,7 @@ const sampleData = {
       title: "The Dark Knight",
       released: 2008,
       tagline: "Why So Serious?",
-      poster_image: path.join(__dirname, '..', 'src', 'assets', 'darknight.jpg'),
+      poster_image: path.join(__dirname, '..', 'src', 'assets', 'dark-knight.jpg'),
       genres: ["Action", "Crime", "Drama", "Thriller"],
       cast: [
         { name: "Christian Bale", roles: ["Bruce Wayne"] },
