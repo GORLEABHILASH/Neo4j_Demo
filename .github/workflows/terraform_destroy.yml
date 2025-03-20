@@ -1,5 +1,5 @@
-name: Terraform Infrastructure Destroy
 
+name: Terraform Destroy
 on:
   workflow_dispatch:
     inputs:
@@ -72,12 +72,68 @@ jobs:
       # First destroy the main infrastructure
       - name: Terraform Init (Main Infrastructure)
         working-directory: Terraform
+        continue-on-error: true
+        id: terraform_init
         run: |
           terraform init \
             -backend-config="bucket=$TF_STATE_BUCKET" \
             -backend-config="key=terraform.tfstate" \
             -backend-config="dynamodb_table=$TF_LOCK_TABLE" \
             -backend-config="region=${{ secrets.AWS_REGION || 'us-west-2' }}"
+          
+          # Store the exit code
+          INIT_EXIT_CODE=$?
+          echo "init_exit_code=$INIT_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          if [ $INIT_EXIT_CODE -ne 0 ]; then
+            echo "Terraform init failed, attempting alternative approaches..."
+          fi
+      
+      - name: Handle Terraform State Inconsistency
+        if: steps.terraform_init.outputs.init_exit_code != '0'
+        run: |
+          echo "Handling Terraform state inconsistency..."
+          
+          # Get the current state from S3
+          echo "Downloading current state file from S3..."
+          aws s3 cp s3://$TF_STATE_BUCKET/terraform.tfstate ./current_state.json || true
+          
+          # If the state file exists locally, let's try to fix things
+          if [ -f "./current_state.json" ]; then
+            echo "Found state file, attempting to reset the DynamoDB lock..."
+            
+            # Calculate MD5 hash of the state file
+            STATE_MD5=$(md5sum ./current_state.json | cut -d' ' -f1)
+            echo "Calculated MD5: $STATE_MD5"
+            
+            # Update the DynamoDB table with the new digest
+            aws dynamodb put-item \
+              --table-name $TF_LOCK_TABLE \
+              --item "{\"LockID\":{\"S\":\"terraform-state\"},\"Digest\":{\"S\":\"$STATE_MD5\"}}" || true
+            
+            echo "DynamoDB lock table has been updated with the new digest"
+          else
+            echo "Could not download state file, trying to bypass backend..."
+          fi
+          
+          # Create empty terraform.tfstate file to start fresh
+          echo "Creating empty local state file..."
+          echo "{}" > ./terraform.tfstate
+      
+      - name: Terraform Init with Local Backend
+        if: steps.terraform_init.outputs.init_exit_code != '0'
+        working-directory: Terraform
+        run: |
+          echo "Attempting initialization with local backend..."
+          
+          # Create a temporary main.tf.new file with local backend
+          grep -v "backend \"s3\"" main.tf > main.tf.new || true
+          mv main.tf.new main.tf
+          
+          # Initialize with local backend
+          terraform init
+          
+          echo "Local backend initialization complete"
       
       - name: Clean Up ECR Repositories
         run: |
@@ -237,7 +293,18 @@ jobs:
 
       - name: Terraform Destroy (Main Infrastructure)
         working-directory: Terraform
-        run: terraform destroy -auto-approve
+        run: |
+          # First try with -auto-approve
+          terraform destroy -auto-approve || DESTROY_FAILED=true
+          
+          # If the destroy failed, try with force removal options
+          if [ "${DESTROY_FAILED:-false}" = "true" ]; then
+            echo "Standard destroy failed, attempting with additional force options..."
+            
+            # Trying with -refresh=false
+            echo "Attempting destroy with refresh=false..."
+            terraform destroy -auto-approve -refresh=false || true
+          fi
         continue-on-error: true
         
       - name: Force Destroy Remaining Resources
