@@ -64,21 +64,22 @@ jobs:
             -var="project_name=${{ env.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION || 'us-west-2' }}"
 
-          # Extract outputs by writing them to files first to avoid capture issues
+          # Extract outputs directly from terraform output command without command substitution
+          # This avoids the GitHub Actions debug info being included in the capture
           terraform output -raw state_bucket_name > bucket_name.txt
           terraform output -raw dynamodb_table_name > table_name.txt
           
-          # Read from files
-          BUCKET_NAME=$(cat bucket_name.txt)
-          TABLE_NAME=$(cat table_name.txt)
+          # Read clean values from files
+          BUCKET_NAME=$(cat bucket_name.txt | tr -d '\n' | tr -d '\r')
+          TABLE_NAME=$(cat table_name.txt | tr -d '\n' | tr -d '\r')
 
           # Debugging: Show extracted values
           echo "Captured bucket name: '$BUCKET_NAME'"
           echo "Captured table name: '$TABLE_NAME'"
 
-          # Validate Bucket Name
+          # Validate Bucket Name format
           if [[ ! "$BUCKET_NAME" =~ ^[a-z0-9.-]{3,63}$ ]]; then
-            echo "Error: Invalid bucket name detected: '$BUCKET_NAME'" >&2
+            echo "Error: Invalid bucket name format detected: '$BUCKET_NAME'" >&2
             exit 1
           fi
 
