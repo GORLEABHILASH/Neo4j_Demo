@@ -8,7 +8,7 @@ const sampleData = {
       title: "The Matrix",
       released: 1999,
       tagline: "Welcome to the Real World",
-      poster_image: "https://image.tmdb.org/t/p/w500/f89U3ADr1oiB1s9GkdPOEpXUk5H.jpg",
+      poster_image: "https://m.media-amazon.com/images/M/MV5BN2NmN2VhMTQtMDNiOS00NDlhLTliMjgtODE2ZTY0ODQyNDRhXkEyXkFqcGc@._V1_.jpg",
       genres: ["Action", "Science Fiction"],
       cast: [
         { name: "Keanu Reeves", roles: ["Neo"], profile_image: "https://image.tmdb.org/t/p/w500/rRdru6REr9i3WIHv2mntpcgxnoY.jpg" },
@@ -20,7 +20,7 @@ const sampleData = {
       title: "Inception",
       released: 2010,
       tagline: "Your mind is the scene of the crime",
-      poster_image: "https://image.tmdb.org/t/p/w500/9gk7adHYeDvHkCSEqAvQNLV5Uge.jpg",
+      poster_image: "https://m.media-amazon.com/images/M/MV5BMjAxMzY3NjcxNF5BMl5BanBnXkFtZTcwNTI5OTM0Mw@@._V1_.jpg",
       genres: ["Action", "Science Fiction", "Adventure"],
       cast: [
         { name: "Leonardo DiCaprio", roles: ["Cobb"], profile_image: "https://image.tmdb.org/t/p/w500/wo2hJpn04vbtmh0B9utCFdsQhxM.jpg" },
@@ -32,7 +32,7 @@ const sampleData = {
       title: "The Dark Knight",
       released: 2008,
       tagline: "Why So Serious?",
-      poster_image: "https://image.tmdb.org/t/p/w500/qJ2tW6WMUDux911r6m7haRef0WH.jpg",
+      poster_image: "https://m.media-amazon.com/images/M/MV5BMTMxNTMwODM0NF5BMl5BanBnXkFtZTcwODAyMTk2Mw@@._V1_.jpg",
       genres: ["Action", "Crime", "Drama", "Thriller"],
       cast: [
         { name: "Christian Bale", roles: ["Bruce Wayne"], profile_image: "https://image.tmdb.org/t/p/w500/2FaYpBQ4o2P8po2w5UDK5TrYVbc.jpg" },
@@ -44,7 +44,7 @@ const sampleData = {
       title: "Interstellar",
       released: 2014,
       tagline: "Mankind was born on Earth. It was never meant to die here.",
-      poster_image: "https://image.tmdb.org/t/p/w500/gEU2QniE6E77NI6lCU6MxlNBvIx.jpg",
+      poster_image: "https://m.media-amazon.com/images/M/MV5BYzdjMDAxZGItMjI2My00ODA1LTlkNzItOWFjMDU5ZDJlYWY3XkEyXkFqcGc@._V1_FMjpg_UX1000_.jpg",
       genres: ["Adventure", "Drama", "Science Fiction"],
       cast: [
         { name: "Matthew McConaughey", roles: ["Cooper"], profile_image: "https://image.tmdb.org/t/p/w500/e9ZHRY5toiBZCIPEEyvOG9A8ers.jpg" },
@@ -56,7 +56,7 @@ const sampleData = {
       title: "The Avengers",
       released: 2012,
       tagline: "Some assembly required",
-      poster_image: "https://image.tmdb.org/t/p/w500/RYMX2wcKCBAr24UyPD7xwmjaTn.jpg",
+      poster_image: "https://m.media-amazon.com/images/M/MV5BNGE0YTVjNzUtNzJjOS00NGNlLTgxMzctZTY4YTE1Y2Y1ZTU4XkEyXkFqcGc@._V1_.jpg",
       genres: ["Action", "Adventure", "Science Fiction"],
       cast: [
         { name: "Robert Downey Jr.", roles: ["Tony Stark"], profile_image: "https://image.tmdb.org/t/p/w500/5qHNjhtjMD4YWH3UP0rm4tKwxCL.jpg" },
