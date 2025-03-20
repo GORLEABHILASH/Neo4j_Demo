@@ -55,6 +55,7 @@ jobs:
           echo "PROJECT_NAME=neo4j-demos" >> $GITHUB_ENV
 
       # Bootstrap terraform state infrastructure with fixed output handling
+      # Bootstrap terraform state infrastructure with proper multiline handling
       - name: Bootstrap Terraform State
         working-directory: bootstrap
         run: |
@@ -62,30 +63,33 @@ jobs:
           terraform init
           terraform apply -auto-approve -var="environment=${{ env.DEPLOY_ENV }}" -var="project_name=${{ env.PROJECT_NAME }}" -var="aws_region=${{ secrets.AWS_REGION || 'us-west-2' }}"
           
-          # Ensure that only the raw output is captured
-          # Ensure Terraform outputs only the expected values
+          # Use GitHub Actions multiline syntax
+          echo "TF_STATE_BUCKET<<EOF" >> $GITHUB_ENV
+          terraform output -raw state_bucket_name >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+          echo "TF_LOCK_TABLE<<EOF" >> $GITHUB_ENV
+          terraform output -raw dynamodb_table_name >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          
+          # Validate outputs still exist (after writing to env file)
           BUCKET_NAME=$(terraform output -raw state_bucket_name 2>/dev/null | tr -d '\r' || echo "")
           TABLE_NAME=$(terraform output -raw dynamodb_table_name 2>/dev/null | tr -d '\r' || echo "")
-
+          
           # Debug: Show extracted values
           echo "Captured bucket name: $BUCKET_NAME"
           echo "Captured table name: $TABLE_NAME"
-
-          # Validate and write to GitHub Actions environment file
-          if [[ -n "$BUCKET_NAME" && "$BUCKET_NAME" != "::debug::Terraform exited with code 0." ]]; then
-            echo "TF_STATE_BUCKET=$BUCKET_NAME" >> "$GITHUB_ENV"
-          else
+          
+          # Validate the outputs
+          if [[ -z "$BUCKET_NAME" ]]; then
             echo "Error: Failed to capture bucket name" >&2
             exit 1
           fi
-
-          if [[ -n "$TABLE_NAME" && "$TABLE_NAME" != "::debug::Terraform exited with code 0." ]]; then
-            echo "TF_LOCK_TABLE=$TABLE_NAME" >> "$GITHUB_ENV"
-          else
+          
+          if [[ -z "$TABLE_NAME" ]]; then
             echo "Error: Failed to capture table name" >&2
             exit 1
           fi
-
 
       - name: Terraform Init
         working-directory: Terraform
