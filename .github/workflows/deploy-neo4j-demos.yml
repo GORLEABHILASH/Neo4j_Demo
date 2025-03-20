@@ -629,8 +629,10 @@ jobs:
           echo "Current pod status:"
           kubectl get pods -n ${{ matrix.demo }}
           
-          DOMAIN_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/domain-name" --query "Parameter.Value" --output text || echo "neo4j-demos.example.com")
-          echo "Deployment completed! Application should be available at: https://${{ matrix.demo }}.$DOMAIN_NAME"
+          # Get the actual load balancer address from the ingress
+          LB_ADDRESS=$(kubectl get ingress -n ${{ matrix.demo }} ${{ matrix.demo }}-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          
+          echo "Deployment completed! Application should be available at: http://$LB_ADDRESS"
           
           # Get service endpoints for logs
           echo "Service endpoints:"

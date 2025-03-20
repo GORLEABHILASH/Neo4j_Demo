@@ -110,8 +110,135 @@ async function getDashboardData() {
 }
 
 // Update the route handler for the landing page
+// Replace the existing app.get('/') route with this code
+// Make sure to place this code correctly in your index.js file
+
+// Add this function to fetch data for the dashboard
+async function getDashboardData() {
+  try {
+    // First, let's check if we have data in the database
+    const checkData = await runQuery(`
+      MATCH (n) RETURN count(n) as nodeCount
+    `);
+    
+    const nodeCount = checkData.records[0].get('nodeCount').toNumber();
+    
+    // If no data, call seedDatabase
+    if (nodeCount === 0) {
+      logger.info('No data found in the database, triggering seed function...');
+      try {
+        const { seedDatabase } = await import('./utils/seed.js');
+        await seedDatabase();
+        logger.info('Database seeded successfully from dashboard');
+      } catch (error) {
+        logger.error('Error seeding database from dashboard:', error);
+      }
+    }
+    
+    // Get genre counts - with better error handling and default values
+    let genres = [];
+    try {
+      const genreResult = await runQuery(`
+        MATCH (g:Genre)<-[:IN_GENRE]-(m:Movie)
+        RETURN g.name AS genre, COUNT(m) AS movieCount
+        ORDER BY movieCount DESC
+        LIMIT 6
+      `);
+      
+      genres = genreResult.records.map(record => ({
+        name: record.get('genre'),
+        count: record.get('movieCount').toNumber()
+      }));
+    } catch (error) {
+      logger.error('Error fetching genre data:', error);
+    }
+    
+    // Get latest movies - with better error handling
+    let latestMovies = [];
+    try {
+      const latestMoviesResult = await runQuery(`
+        MATCH (m:Movie)
+        RETURN m.title AS title, m.released AS released, m.poster_image AS posterImage, m.tagline AS tagline
+        ORDER BY m.released DESC
+        LIMIT 6
+      `);
+      
+      latestMovies = latestMoviesResult.records.map(record => ({
+        title: record.get('title'),
+        released: record.get('released'),
+        posterImage: record.get('posterImage'),
+        tagline: record.get('tagline')
+      }));
+    } catch (error) {
+      logger.error('Error fetching latest movies:', error);
+    }
+    
+    // Get actor counts - with better error handling
+    let topActors = [];
+    try {
+      const actorResult = await runQuery(`
+        MATCH (p:Person)-[:ACTED_IN]->(m:Movie)
+        WITH p, COUNT(m) AS movieCount
+        RETURN p.name AS name, p.profile_image AS profileImage, movieCount
+        ORDER BY movieCount DESC
+        LIMIT 6
+      `);
+      
+      topActors = actorResult.records.map(record => ({
+        name: record.get('name'),
+        profileImage: record.get('profileImage'),
+        movieCount: record.get('movieCount').toNumber()
+      }));
+    } catch (error) {
+      logger.error('Error fetching actor data:', error);
+    }
+    
+    // Get total counts separately for better error handling
+    let counts = { movies: 0, people: 0, genres: 0 };
+    
+    try {
+      const movieCountResult = await runQuery('MATCH (m:Movie) RETURN COUNT(m) AS count');
+      counts.movies = movieCountResult.records[0].get('count').toNumber();
+    } catch (error) {
+      logger.error('Error counting movies:', error);
+    }
+    
+    try {
+      const peopleCountResult = await runQuery('MATCH (p:Person) RETURN COUNT(p) AS count');
+      counts.people = peopleCountResult.records[0].get('count').toNumber();
+    } catch (error) {
+      logger.error('Error counting people:', error);
+    }
+    
+    try {
+      const genreCountResult = await runQuery('MATCH (g:Genre) RETURN COUNT(g) AS count');
+      counts.genres = genreCountResult.records[0].get('count').toNumber();
+    } catch (error) {
+      logger.error('Error counting genres:', error);
+    }
+    
+    return {
+      genres,
+      latestMovies,
+      topActors,
+      counts
+    };
+  } catch (error) {
+    console.error('Error fetching dashboard data:', error);
+    return {
+      genres: [],
+      latestMovies: [],
+      topActors: [],
+      counts: { movies: 0, people: 0, genres: 0 }
+    };
+  }
+}
+
+// Update the route handler for the landing page
 app.get('/', async (req, res) => {
   try {
+    // Import required modules
+    const { logger } = await import('./utils/logger.js');
     const dashboardData = await getDashboardData();
     
     res.send(`
@@ -210,13 +337,23 @@ app.get('/', async (req, res) => {
         </nav>
         
         <!-- Header with dashboard overview -->
-        <div class="header-container">
+                  <div class="header-container">
           <div class="container">
             <div class="row align-items-center">
               <div class="col-md-8">
                 <h1>Movie Recommendation Engine</h1>
                 <p class="lead">Powered by Neo4j Graph Database</p>
                 <p>Explore relationships between movies, actors, and genres with graph-based recommendations</p>
+                
+                <!-- Search Form -->
+                <div class="mt-4">
+                  <form action="/api/search" method="GET" class="d-flex">
+                    <input type="text" name="q" class="form-control" placeholder="Search for a movie..." required>
+                    <button type="submit" class="btn btn-light ms-2">
+                      <i class="bi bi-search"></i> Search
+                    </button>
+                  </form>
+                </div>
               </div>
               <div class="col-md-4 text-center">
                 <img src="https://dist.neo4j.com/wp-content/uploads/20210423072633/neo4j-logo-2020-1.svg" alt="Neo4j Logo" style="max-width: 200px;">
@@ -323,6 +460,51 @@ app.get('/', async (req, res) => {
           </div>
         </div>
         
+        <!-- Graph Visualization -->
+        <div class="container mb-5">
+          <h2 class="mb-4">Graph Visualization</h2>
+          <div class="card">
+            <div class="card-body">
+              <div class="text-center mb-3">
+                <img src="https://dist.neo4j.com/wp-content/uploads/20231106123052/graph-visualization.png" 
+                     alt="Neo4j Graph Visualization" 
+                     style="max-width: 100%; height: auto; border-radius: 8px;">
+              </div>
+              <h5 class="text-center">Neo4j Movie Database Schema</h5>
+              <p class="text-center">This graph shows how movies, actors, and genres are connected in our database.</p>
+              <div class="row mt-3">
+                <div class="col-md-4">
+                  <div class="card bg-light">
+                    <div class="card-body text-center">
+                      <i class="bi bi-film text-primary mb-2" style="font-size: 1.5rem;"></i>
+                      <h6>Movie Nodes</h6>
+                      <p class="small mb-0">Contain title, release year, and tagline</p>
+                    </div>
+                  </div>
+                </div>
+                <div class="col-md-4">
+                  <div class="card bg-light">
+                    <div class="card-body text-center">
+                      <i class="bi bi-people text-success mb-2" style="font-size: 1.5rem;"></i>
+                      <h6>Person Nodes</h6>
+                      <p class="small mb-0">Actors who starred in movies</p>
+                    </div>
+                  </div>
+                </div>
+                <div class="col-md-4">
+                  <div class="card bg-light">
+                    <div class="card-body text-center">
+                      <i class="bi bi-tags text-danger mb-2" style="font-size: 1.5rem;"></i>
+                      <h6>Genre Nodes</h6>
+                      <p class="small mb-0">Categories that classify movies</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
         <!-- API Reference -->
         <div class="container">
           <div class="api-section">
@@ -333,12 +515,17 @@ app.get('/', async (req, res) => {
                   <div class="card-body">
                     <h5><code>GET /api/genres</code></h5>
                     <p class="mb-0">Get all movie genres</p>
+                    <a href="/api/genres" class="btn btn-sm btn-outline-primary mt-2">Try it</a>
                   </div>
                 </div>
                 <div class="card mb-3">
                   <div class="card-body">
                     <h5><code>GET /api/movies/by-genre/:genre</code></h5>
                     <p class="mb-0">Get movies by genre</p>
+                    <div class="mt-2">
+                      <a href="/api/movies/by-genre/Action" class="btn btn-sm btn-outline-primary">Action</a>
+                      <a href="/api/movies/by-genre/Science%20Fiction" class="btn btn-sm btn-outline-primary">Sci-Fi</a>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -347,18 +534,30 @@ app.get('/', async (req, res) => {
                   <div class="card-body">
                     <h5><code>GET /api/movies/:title</code></h5>
                     <p class="mb-0">Get movie details including cast</p>
+                    <div class="mt-2">
+                      <a href="/api/movies/The%20Matrix" class="btn btn-sm btn-outline-primary">The Matrix</a>
+                      <a href="/api/movies/Inception" class="btn btn-sm btn-outline-primary">Inception</a>
+                    </div>
                   </div>
                 </div>
                 <div class="card mb-3">
                   <div class="card-body">
                     <h5><code>GET /api/movies/:title/recommendations</code></h5>
                     <p class="mb-0">Get recommended movies</p>
+                    <div class="mt-2">
+                      <a href="/api/movies/The%20Matrix/recommendations" class="btn btn-sm btn-outline-primary">Matrix Recs</a>
+                      <a href="/api/movies/Interstellar/recommendations" class="btn btn-sm btn-outline-primary">Interstellar Recs</a>
+                    </div>
                   </div>
                 </div>
                 <div class="card mb-3">
                   <div class="card-body">
                     <h5><code>GET /api/search?q=query</code></h5>
                     <p class="mb-0">Search movies by title</p>
+                    <div class="mt-2">
+                      <a href="/api/search?q=dark" class="btn btn-sm btn-outline-primary">Search "dark"</a>
+                      <a href="/api/search?q=inter" class="btn btn-sm btn-outline-primary">Search "inter"</a>
+                    </div>
                   </div>
                 </div>
               </div>
