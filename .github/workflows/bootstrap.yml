@@ -5,10 +5,21 @@ on:
     paths:
       - 'bootstrap/**'
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
 
 jobs:
   bootstrap:
     runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
@@ -23,20 +34,45 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
 
+      - name: Determine Resource Names
+        id: resource_names
+        run: |
+          # Set environment and prefix
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          PREFIX="neo4j-demos"
+          
+          # Construct resource names using the prefix and environment
+          BUCKET_NAME="${PREFIX}-terraform-state-${ENV}"
+          TABLE_NAME="${PREFIX}-terraform-locks-${ENV}"
+          
+          # Override with GitHub environment variables if they exist
+          if [[ -n "${{ vars.TF_STATE_BUCKET }}" ]]; then
+            BUCKET_NAME="${{ vars.TF_STATE_BUCKET }}"
+          fi
+          
+          if [[ -n "${{ vars.TF_LOCK_TABLE }}" ]]; then
+            TABLE_NAME="${{ vars.TF_LOCK_TABLE }}"
+          fi
+          
+          # Set output variables
+          echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          echo "table_name=$TABLE_NAME" >> $GITHUB_OUTPUT
+          
+          echo "Using resource names:"
+          echo "  - Bucket: $BUCKET_NAME"
+          echo "  - Table: $TABLE_NAME"
+
       - name: Clean Up Existing Resources
         run: |
-          # Define resource names
-          BUCKET_NAME="neo4j-demos-terraform-state-dev"
-          TABLE_NAME="neo4j-demos-terraform-locks-dev"
+          BUCKET_NAME="${{ steps.resource_names.outputs.bucket_name }}"
+          TABLE_NAME="${{ steps.resource_names.outputs.table_name }}"
           
           echo "Checking for existing resources..."
           
           # Check and delete S3 bucket if it exists
           if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
             echo "Found existing bucket. Cleaning up..."
-            # Empty bucket first
             aws s3 rm s3://$BUCKET_NAME --recursive
-            # Delete bucket
             aws s3api delete-bucket --bucket $BUCKET_NAME
             echo "Bucket deleted successfully"
           else
@@ -47,7 +83,6 @@ jobs:
           if aws dynamodb describe-table --table-name "$TABLE_NAME" 2>/dev/null; then
             echo "Found existing table. Cleaning up..."
             aws dynamodb delete-table --table-name $TABLE_NAME
-            # Wait for deletion to complete
             aws dynamodb wait table-not-exists --table-name $TABLE_NAME
             echo "Table deleted successfully"
           else
@@ -65,36 +100,25 @@ jobs:
           # Apply terraform configuration
           terraform apply -auto-approve
           
-          # Direct approach - directly grep the output instead of using jq
-          # This avoids the jq parsing error
-          echo "Capturing Terraform outputs..."
+          # Use the resource names from the earlier step
+          BUCKET_NAME="${{ steps.resource_names.outputs.bucket_name }}"
+          TABLE_NAME="${{ steps.resource_names.outputs.table_name }}"
           
-          # Capture the raw output and extract values using grep/sed
-          terraform output > terraform_output.txt
-          
-          # Extract values using grep and sed (more reliable than jq for malformed output)
-          BUCKET_NAME=$(grep "state_bucket_name" terraform_output.txt | sed 's/state_bucket_name = "\(.*\)"/\1/')
-          TABLE_NAME=$(grep "dynamodb_table_name" terraform_output.txt | sed 's/dynamodb_table_name = "\(.*\)"/\1/')
-          
-          # Trim whitespace
-          BUCKET_NAME=$(echo "$BUCKET_NAME" | xargs)
-          TABLE_NAME=$(echo "$TABLE_NAME" | xargs)
-          
-          echo "Extracted bucket name: $BUCKET_NAME"
-          echo "Extracted table name: $TABLE_NAME"
-          
-          # Store in GitHub environment variables
+          # Set the environment variables
           echo "TF_STATE_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
           echo "TF_LOCK_TABLE=$TABLE_NAME" >> $GITHUB_ENV
-
+      
       - name: Store Outputs in SSM
         run: |
-          echo "Storing values in SSM:"
+          # Get environment
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          
+          echo "Storing values in SSM for environment: $ENV"
           echo "  - Bucket name: $TF_STATE_BUCKET"
           echo "  - Table name: $TF_LOCK_TABLE"
           
-          # Store in SSM
-          aws ssm put-parameter --name "/terraform/state_bucket" --value "$TF_STATE_BUCKET" --type "String" --overwrite
-          aws ssm put-parameter --name "/terraform/lock_table" --value "$TF_LOCK_TABLE" --type "String" --overwrite
+          # Store in SSM with environment prefix
+          aws ssm put-parameter --name "/terraform/$ENV/state_bucket" --value "$TF_STATE_BUCKET" --type "String" --overwrite
+          aws ssm put-parameter --name "/terraform/$ENV/lock_table" --value "$TF_LOCK_TABLE" --type "String" --overwrite
           
           echo "Successfully stored Terraform outputs in SSM Parameter Store"
