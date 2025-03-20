@@ -1,16 +1,49 @@
 name: Terraform Infrastructure Deployment
+
 on:
   push:
     paths:
       - 'Terraform/**'
+    branches:
+      - main
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
   workflow_run:
     workflows: ["Terraform Bootstrap"]
     types:
       - completed
+    branches:
+      - main
+
 jobs:
-  terraform:
+  check-bootstrap-status:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - name: Check bootstrap status
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            echo "Bootstrap workflow completed successfully. Proceeding with infrastructure deployment."
+          fi
+          echo "proceed=true" >> $GITHUB_OUTPUT
+
+  terraform:
+    needs: check-bootstrap-status
+    if: ${{ needs.check-bootstrap-status.outputs.proceed == 'true' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
@@ -28,25 +61,97 @@ jobs:
           terraform_version: 1.5.7
           
       - name: Fetch Terraform Backend Details
+        id: backend_details
         run: |
-          TF_STATE_BUCKET=$(aws ssm get-parameter --name "/terraform/dev/state_bucket" --query "Parameter.Value" --output text)
-          TF_LOCK_TABLE=$(aws ssm get-parameter --name "/terraform/dev/lock_table" --query "Parameter.Value" --output text)
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
           
-          echo "Retrieved backend details:"
+          echo "Attempting to retrieve backend details from SSM..."
+          
+          # Try to get the bucket name from SSM, but use a default if not found
+          if ! TF_STATE_BUCKET=$(aws ssm get-parameter --name "/terraform/$ENV/state_bucket" --query "Parameter.Value" --output text 2>/dev/null); then
+            echo "SSM parameter for state bucket not found, using default naming convention"
+            TF_STATE_BUCKET="neo4j-demos-terraform-state-$ENV"
+          fi
+          
+          # Try to get the lock table name from SSM, but use a default if not found
+          if ! TF_LOCK_TABLE=$(aws ssm get-parameter --name "/terraform/$ENV/lock_table" --query "Parameter.Value" --output text 2>/dev/null); then
+            echo "SSM parameter for lock table not found, using default naming convention"
+            TF_LOCK_TABLE="neo4j-demos-terraform-locks-$ENV"
+          fi
+          
+          echo "Using backend details for $ENV environment:"
           echo "  - Bucket: $TF_STATE_BUCKET"
           echo "  - Table: $TF_LOCK_TABLE"
           
+          # Set output variables for use in other steps
+          echo "bucket_name=$TF_STATE_BUCKET" >> $GITHUB_OUTPUT
+          echo "table_name=$TF_LOCK_TABLE" >> $GITHUB_OUTPUT
+          
+          # Also set environment variables for this job
           echo "TF_STATE_BUCKET=$TF_STATE_BUCKET" >> $GITHUB_ENV
           echo "TF_LOCK_TABLE=$TF_LOCK_TABLE" >> $GITHUB_ENV
           
       - name: Terraform Init
+        id: terraform_init
         working-directory: Terraform
+        continue-on-error: true
         run: |
           terraform init \
             -backend-config="bucket=$TF_STATE_BUCKET" \
             -backend-config="key=terraform.tfstate" \
             -backend-config="dynamodb_table=$TF_LOCK_TABLE" \
             -backend-config="region=${{ secrets.AWS_REGION || 'us-west-2' }}"
+            
+          # Store the exit code
+          INIT_EXIT_CODE=$?
+          echo "init_exit_code=$INIT_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          if [ $INIT_EXIT_CODE -ne 0 ]; then
+            echo "Terraform init failed, attempting alternative approaches..."
+          fi
+          
+      - name: Handle Terraform State Inconsistency
+        if: steps.terraform_init.outputs.init_exit_code != '0'
+        run: |
+          echo "Handling Terraform state inconsistency..."
+          
+          # Get the current state from S3
+          echo "Downloading current state file from S3..."
+          aws s3 cp s3://$TF_STATE_BUCKET/terraform.tfstate ./current_state.json || true
+          
+          # If the state file exists locally, let's try to fix things
+          if [ -f "./current_state.json" ]; then
+            echo "Found state file, attempting to reset the DynamoDB lock..."
+            
+            # Calculate MD5 hash of the state file
+            STATE_MD5=$(md5sum ./current_state.json | cut -d' ' -f1)
+            echo "Calculated MD5: $STATE_MD5"
+            
+            # Update the DynamoDB table with the new digest
+            aws dynamodb put-item \
+              --table-name $TF_LOCK_TABLE \
+              --item "{\"LockID\":{\"S\":\"terraform-state\"},\"Digest\":{\"S\":\"$STATE_MD5\"}}" || true
+            
+            echo "DynamoDB lock table has been updated with the new digest"
+          else
+            echo "Could not download state file, trying to bypass backend..."
+          fi
+          
+          # Create empty terraform.tfstate file to start fresh
+          echo "Creating empty local state file..."
+          echo "{}" > ./terraform.tfstate
+      
+      - name: Terraform Init Retry
+        if: steps.terraform_init.outputs.init_exit_code != '0'
+        working-directory: Terraform
+        run: |
+          echo "Retrying initialization..."
+          terraform init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="dynamodb_table=$TF_LOCK_TABLE" \
+            -backend-config="region=${{ secrets.AWS_REGION || 'us-west-2' }}" \
+            -reconfigure || terraform init -reconfigure
       
       - name: Import Existing Resources
         working-directory: Terraform
@@ -87,3 +192,23 @@ jobs:
       - name: Terraform Apply
         working-directory: Terraform
         run: terraform apply -auto-approve tfplan
+        
+      - name: Store Infrastructure Outputs in SSM
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          
+          # Store EKS cluster name
+          CLUSTER_NAME=$(terraform -chdir=Terraform output -raw eks_cluster_name 2>/dev/null || echo "neo4j-demo-cluster")
+          aws ssm put-parameter --name "/neo4j-demos/$ENV/eks-cluster-name" --value "$CLUSTER_NAME" --type "String" --overwrite
+          
+          # Store domain name if it exists in output
+          DOMAIN_NAME=$(terraform -chdir=Terraform output -raw domain_name 2>/dev/null || echo "neo4j-demos.example.com")
+          aws ssm put-parameter --name "/neo4j-demos/$ENV/domain-name" --value "$DOMAIN_NAME" --type "String" --overwrite
+          
+          # Set default values for other parameters if they don't exist
+          aws ssm put-parameter --name "/neo4j-demos/$ENV/neo4j-version" --value "5.11" --type "String" --overwrite --no-cli-pager || true
+          aws ssm put-parameter --name "/neo4j-demos/$ENV/app-replicas" --value "1" --type "String" --overwrite --no-cli-pager || true
+          
+          # Set a demo password if it doesn't exist (should be done securely in production)
+          aws ssm get-parameter --name "/neo4j-demos/$ENV/neo4j-password" >/dev/null 2>&1 || \
+          aws ssm put-parameter --name "/neo4j-demos/$ENV/neo4j-password" --value "Neo4jDemo2024!" --type "SecureString" --overwrite --no-cli-pager

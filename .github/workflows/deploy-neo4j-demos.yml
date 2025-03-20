@@ -7,7 +7,7 @@ on:
     types:
       - completed
     branches: [main]
-  # Keep existing triggers
+  # Run when demo code changes
   push:
     branches: [main]
     paths:
@@ -17,6 +17,7 @@ on:
     branches: [main]
     paths:
       - 'demos/**'
+  # Manual trigger
   workflow_dispatch:
     inputs:
       demo_name:
@@ -70,11 +71,18 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      deploy_env: ${{ steps.set-env.outputs.deploy_env }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
+      
+      - name: Set environment
+        id: set-env
+        run: |
+          DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
+          echo "deploy_env=$DEPLOY_ENV" >> $GITHUB_OUTPUT
       
       - name: Determine demos to process
         id: set-matrix
@@ -101,11 +109,25 @@ jobs:
             
           elif [[ "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "pull_request" ]]; then
             # Find changed demos
-            BEFORE_SHA=${{ github.event.before || 'HEAD~1' }}
-            CURRENT_SHA=${{ github.sha }}
-            CHANGED_DEMOS=$(git diff --name-only $BEFORE_SHA $CURRENT_SHA | grep "^demos/" | cut -d/ -f2 | sort | uniq | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              BEFORE_SHA="${{ github.event.before }}"
+              CURRENT_SHA="${{ github.sha }}"
+            else
+              # For PR, compare the base branch with the head branch
+              BEFORE_SHA="${{ github.event.pull_request.base.sha }}"
+              CURRENT_SHA="${{ github.event.pull_request.head.sha }}"
+            fi
+            
+            CHANGED_FILES=$(git diff --name-only $BEFORE_SHA $CURRENT_SHA)
+            CHANGED_DEMOS=$(echo "$CHANGED_FILES" | grep "^demos/" | cut -d/ -f2 | sort | uniq | jq -R -s -c 'split("\n") | map(select(length > 0))')
             echo "matrix={\"demo\":$CHANGED_DEMOS}" >> $GITHUB_OUTPUT
             echo "Selected demos to process: $CHANGED_DEMOS"
+            
+          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            # Deploy all demos after infrastructure deployment
+            DEMOS=$(ls -1 demos/ | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "matrix={\"demo\":$DEMOS}" >> $GITHUB_OUTPUT
+            echo "Selected demos to process (after infrastructure deployment): $DEMOS"
             
           else
             # Default to empty if somehow nothing is selected
@@ -117,6 +139,7 @@ jobs:
     needs: determine-demos
     if: ${{ fromJson(needs.determine-demos.outputs.matrix).demo[0] != null }}
     runs-on: ubuntu-latest
+    environment: ${{ needs.determine-demos.outputs.deploy_env }}
     strategy:
       matrix: ${{ fromJson(needs.determine-demos.outputs.matrix) }}
       fail-fast: false
@@ -151,7 +174,7 @@ jobs:
       - name: Set environment & build ID
         if: steps.check-demo.outputs.skip != 'true'
         run: |
-          DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
+          DEPLOY_ENV="${{ needs.determine-demos.outputs.deploy_env }}"
           echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
           echo "BUILD_ID=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
           echo "AWS_REGION=${{ secrets.AWS_REGION || 'us-west-2' }}" >> $GITHUB_ENV
@@ -220,6 +243,7 @@ jobs:
     needs: [determine-demos, build-and-push]
     if: ${{ fromJson(needs.determine-demos.outputs.matrix).demo[0] != null && github.event.inputs.build_only != 'true' }}
     runs-on: ubuntu-latest
+    environment: ${{ needs.determine-demos.outputs.deploy_env }}
     strategy:
       matrix: ${{ fromJson(needs.determine-demos.outputs.matrix) }}
       fail-fast: false
@@ -249,7 +273,7 @@ jobs:
       - name: Set environment variables
         if: steps.check-demo.outputs.skip != 'true'
         run: |
-          DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
+          DEPLOY_ENV="${{ needs.determine-demos.outputs.deploy_env }}"
           echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
           echo "BUILD_ID=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
           echo "AWS_REGION=${{ secrets.AWS_REGION || 'us-west-2' }}" >> $GITHUB_ENV
@@ -263,7 +287,7 @@ jobs:
         if: steps.check-demo.outputs.skip != 'true'
         id: cluster-info
         run: |
-          # Try to get the cluster name from Terraform outputs in SSM Parameter Store
+          # Try to get the cluster name from SSM Parameter Store
           CLUSTER_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/eks-cluster-name" --query "Parameter.Value" --output text 2>/dev/null || echo "neo4j-demo-cluster")
           echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
           echo "Using EKS cluster: $CLUSTER_NAME"
@@ -517,11 +541,11 @@ jobs:
         if: steps.check-demo.outputs.skip != 'true'
         run: |
           # Get configuration from parameter store
-          DOMAIN_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/domain-name" --query "Parameter.Value" --output text || echo "neo4j-demos.example.com")
-          NEO4J_VERSION=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-version" --query "Parameter.Value" --output text || echo "4.4")
-          NEO4J_PASSWORD=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-password" --with-decryption --query "Parameter.Value" --output text || echo "password")
-          REPLICAS=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/app-replicas" --query "Parameter.Value" --output text || echo "1")
-          IMAGE_TAG=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/${{ matrix.demo }}-image-tag" --query "Parameter.Value" --output text || echo "${{ env.DEPLOY_ENV }}-latest")
+          DOMAIN_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/domain-name" --query "Parameter.Value" --output text 2>/dev/null || echo "neo4j-demos.example.com")
+          NEO4J_VERSION=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-version" --query "Parameter.Value" --output text 2>/dev/null || echo "5.11")
+          NEO4J_PASSWORD=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-password" --with-decryption --query "Parameter.Value" --output text 2>/dev/null || echo "Neo4jDemo2024!")
+          REPLICAS=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/app-replicas" --query "Parameter.Value" --output text 2>/dev/null || echo "1")
+          IMAGE_TAG=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/${{ matrix.demo }}-image-tag" --query "Parameter.Value" --output text 2>/dev/null || echo "${{ env.DEPLOY_ENV }}-latest")
           
           # Get ECR registry address
           ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
@@ -630,10 +654,14 @@ jobs:
           kubectl get pods -n ${{ matrix.demo }}
           
           # Get the actual load balancer address from the ingress
-          LB_ADDRESS=$(kubectl get ingress -n ${{ matrix.demo }} ${{ matrix.demo }}-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          LB_ADDRESS=$(kubectl get ingress -n ${{ matrix.demo }} ${{ matrix.demo }}-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
           
-          echo "Deployment completed! Application should be available at: http://$LB_ADDRESS"
+          if [ "$LB_ADDRESS" != "pending" ] && [ -n "$LB_ADDRESS" ]; then
+            echo "Deployment completed! Application should be available at: http://$LB_ADDRESS"
+          else
+            echo "Load balancer address not yet available. Check ingress status in a few minutes."
+          fi
           
           # Get service endpoints for logs
           echo "Service endpoints:"
-          kubectl get ingress,svc -n ${{ matrix.demo }} -o wide || echo "No ingress found"
+          kubectl get ingress,svc -n ${{ matrix.demo }} -o wide || echo "No resources found"
