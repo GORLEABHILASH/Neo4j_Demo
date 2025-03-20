@@ -58,6 +58,7 @@ jobs:
       # Bootstrap terraform state infrastructure with proper multiline handling
       # Bootstrap terraform state infrastructure with clean output capturing
       # Bootstrap terraform state infrastructure with clean output capturing
+      
       - name: Bootstrap Terraform State
         working-directory: bootstrap
         run: |
@@ -67,16 +68,16 @@ jobs:
             -var="environment=${{ env.DEPLOY_ENV }}" \
             -var="project_name=${{ env.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION || 'us-west-2' }}"
-          
-          # Capture Terraform outputs without additional debug output
-          BUCKET_NAME=$(terraform output -raw state_bucket_name 2>/dev/null | tr -d '\n\r ')
-          TABLE_NAME=$(terraform output -raw dynamodb_table_name 2>/dev/null | tr -d '\n\r ')
+
+          # Extract outputs with clean parsing
+          BUCKET_NAME=$(terraform output -raw state_bucket_name 2>/dev/null | sed 's/[^a-zA-Z0-9.-]//g')
+          TABLE_NAME=$(terraform output -raw dynamodb_table_name 2>/dev/null | sed 's/[^a-zA-Z0-9.-]//g')
 
           # Debugging: Show extracted values
           echo "Captured bucket name: '$BUCKET_NAME'"
           echo "Captured table name: '$TABLE_NAME'"
 
-          # Validate Bucket Name (Ensure it follows AWS naming rules)
+          # Validate Bucket Name
           if [[ ! "$BUCKET_NAME" =~ ^[a-z0-9.-]{3,63}$ ]]; then
             echo "Error: Invalid bucket name detected: '$BUCKET_NAME'" >&2
             exit 1
@@ -97,24 +98,7 @@ jobs:
           echo "TF_STATE_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
           echo "TF_LOCK_TABLE=$TABLE_NAME" >> $GITHUB_ENV
 
-          - name: Terraform Init
-          working-directory: Terraform
-          run: |
-            # Debugging: Show what values will be used
-            echo "Using bucket name: '$TF_STATE_BUCKET'"
-            echo "Using lock table: '$TF_LOCK_TABLE'"
-        
-            # Validate that environment variables are correctly set
-            if [[ -z "$TF_STATE_BUCKET" ]]; then
-              echo "Error: TF_STATE_BUCKET is empty!" >&2
-              exit 1
-            fi
-        
-            if [[ -z "$TF_LOCK_TABLE" ]]; then
-              echo "Error: TF_LOCK_TABLE is empty!" >&2
-              exit 1
-            fi
-        
+         
       - name: Terraform Init
         working-directory: Terraform
         run: |
@@ -139,6 +123,7 @@ jobs:
             -backend-config="key=${{ env.DEPLOY_ENV }}/terraform.tfstate" \
             -backend-config="region=${{ secrets.AWS_REGION || 'us-west-2' }}" \
             -backend-config="dynamodb_table=$TF_LOCK_TABLE"
+      
     
         
 
