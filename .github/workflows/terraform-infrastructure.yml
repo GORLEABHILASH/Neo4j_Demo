@@ -62,28 +62,19 @@ jobs:
           terraform init
           terraform apply -auto-approve -var="environment=${{ env.DEPLOY_ENV }}" -var="project_name=${{ env.PROJECT_NAME }}" -var="aws_region=${{ secrets.AWS_REGION || 'us-west-2' }}"
           
-          # Explicitly store outputs in variables with error handling
-          BUCKET_NAME=$(terraform output -raw state_bucket_name || echo "")
-          TABLE_NAME=$(terraform output -raw dynamodb_table_name || echo "")
+          # Turn off terraform wrapper for clean output capture
+          export TERRAFORM_WRAPPER=false
           
-          # Verify outputs were captured correctly
+          # Now capture the outputs cleanly
+          BUCKET_NAME=$(terraform output -raw state_bucket_name)
+          TABLE_NAME=$(terraform output -raw dynamodb_table_name)
+          
           echo "Captured bucket name: ${BUCKET_NAME}"
           echo "Captured table name: ${TABLE_NAME}"
           
-          # Only set environment variables if values were captured
-          if [ -n "${BUCKET_NAME}" ]; then
-            echo "TF_STATE_BUCKET=${BUCKET_NAME}" >> $GITHUB_ENV
-          else
-            echo "Failed to capture state bucket name"
-            exit 1
-          fi
-          
-          if [ -n "${TABLE_NAME}" ]; then
-            echo "TF_LOCK_TABLE=${TABLE_NAME}" >> $GITHUB_ENV
-          else
-            echo "Failed to capture DynamoDB table name"
-            exit 1
-          fi
+          # Set environment variables
+          echo "TF_STATE_BUCKET=${BUCKET_NAME}" >> $GITHUB_ENV
+          echo "TF_LOCK_TABLE=${TABLE_NAME}" >> $GITHUB_ENV
 
       - name: Terraform Init
         working-directory: Terraform
