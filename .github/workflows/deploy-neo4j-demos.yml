@@ -8,9 +8,9 @@ on:
       - completed
     branches: [main]
   # Keep existing triggers
-  # push:
-  #   branches: [main]
-  #   paths:
+  push:
+    branches: [main]
+    paths:
       - 'demos/**'
       - '.github/workflows/deploy-neo4j-demos.yml'
   pull_request:
