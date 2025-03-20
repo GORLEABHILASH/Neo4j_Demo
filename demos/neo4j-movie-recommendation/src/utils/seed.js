@@ -1,5 +1,5 @@
-import { runQuery } from '../neo4j';
-import { logger } from './logger';
+import { runQuery } from '../neo4j.js';
+import { logger } from './logger.js';
 
 // Sample movie data for seeding the database
 const sampleData = {

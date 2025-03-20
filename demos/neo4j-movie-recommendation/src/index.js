@@ -3,10 +3,10 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
-import { getDriver } from './neo4j';
-import routes from './routes';
-import { logger } from './utils/logger';
-import { seedDatabase } from './utils/seed';
+import { getDriver } from './neo4j.js';
+import routes from './routes.js';
+import { logger } from './utils/logger.js';
+import { seedDatabase } from './utils/seed.js';
 
 // Load environment variables
 dotenv.config();
@@ -24,6 +24,33 @@ app.use(morgan('combined', { stream: { write: message => logger.info(message.tri
 // Health and readiness checks
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'UP' });
+});
+
+// Add this to index.js before the API routes
+app.get('/', (req, res) => {
+  res.send(`
+    <html>
+      <head>
+        <title>Neo4j Movie Recommendation API</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
+          h1 { color: #333; }
+          code { background-color: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
+        </style>
+      </head>
+      <body>
+        <h1>Neo4j Movie Recommendation API</h1>
+        <p>Available endpoints:</p>
+        <ul>
+          <li><code>GET /api/genres</code> - Get all movie genres</li>
+          <li><code>GET /api/movies/by-genre/:genre</code> - Get movies by genre</li>
+          <li><code>GET /api/movies/:title</code> - Get movie details including cast</li>
+          <li><code>GET /api/movies/:title/recommendations</code> - Get recommended movies</li>
+          <li><code>GET /api/search?q=query</code> - Search movies by title</li>
+        </ul>
+      </body>
+    </html>
+  `);
 });
 
 app.get('/ready', async (req, res) => {
@@ -69,6 +96,8 @@ app.listen(port, async () => {
       logger.info('Seeding database with initial data...');
       await seedDatabase();
       logger.info('Database seeded successfully');
+    } else {
+      logger.info('Database already contains data, skipping seeding');
     }
   } catch (error) {
     logger.error('Error checking/seeding database:', error);
@@ -82,8 +111,9 @@ async function checkIfDatabaseNeedsSeeding() {
   
   try {
     const result = await session.run('MATCH (m:Movie) RETURN count(m) as count');
-    const count = result.records[0].get('count').toNumber();
-    return count === 0;
+    const count = result.records[0].get('count');
+    // Check if count is a number or a neo4j Integer and handle appropriately
+    return typeof count === 'number' ? count === 0 : count.toNumber() === 0;
   } catch (error) {
     logger.error('Error checking if database needs seeding:', error);
     return false;
@@ -109,4 +139,3 @@ process.on('SIGTERM', async () => {
 });
 
 export default app;
-//test test2 test 3 test 14

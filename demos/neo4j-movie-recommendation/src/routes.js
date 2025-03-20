@@ -1,6 +1,6 @@
 import { Router } from 'express';
-import { runQuery } from './neo4j';
-import { logger } from './utils/logger';
+import { runQuery } from './neo4j.js';
+import { logger } from './utils/logger.js';
 
 const router = Router();
 

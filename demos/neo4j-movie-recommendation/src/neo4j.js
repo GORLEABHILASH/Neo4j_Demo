@@ -1,5 +1,5 @@
 import neo4j from 'neo4j-driver';
-import { logger } from './utils/logger';
+import { logger } from './utils/logger.js';
 
 // Neo4j connection details from environment variables
 const uri = process.env.NEO4J_URI || 'bolt://neo4j:7687';
