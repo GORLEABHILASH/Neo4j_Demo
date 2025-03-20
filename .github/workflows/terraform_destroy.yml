@@ -1,0 +1,106 @@
+name: Terraform Infrastructure Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      confirmation:
+        description: 'Type "DESTROY" to confirm destruction'
+        required: true
+        type: string
+
+jobs:
+  terraform-destroy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirmation == 'DESTROY' }}
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-west-2' }}
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.7
+          
+      - name: Fetch Terraform Backend Details
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          
+          TF_STATE_BUCKET=$(aws ssm get-parameter --name "/terraform/$ENV/state_bucket" --query "Parameter.Value" --output text)
+          TF_LOCK_TABLE=$(aws ssm get-parameter --name "/terraform/$ENV/lock_table" --query "Parameter.Value" --output text)
+          
+          echo "Retrieved backend details for $ENV environment:"
+          echo "  - Bucket: $TF_STATE_BUCKET"
+          echo "  - Table: $TF_LOCK_TABLE"
+          
+          echo "TF_STATE_BUCKET=$TF_STATE_BUCKET" >> $GITHUB_ENV
+          echo "TF_LOCK_TABLE=$TF_LOCK_TABLE" >> $GITHUB_ENV
+          
+      # First destroy the main infrastructure
+      - name: Terraform Init (Main Infrastructure)
+        working-directory: Terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="dynamodb_table=$TF_LOCK_TABLE" \
+            -backend-config="region=${{ secrets.AWS_REGION || 'us-west-2' }}"
+      
+      - name: Terraform Destroy (Main Infrastructure)
+        working-directory: Terraform
+        run: terraform destroy -auto-approve
+        
+      # Then destroy the bootstrap resources
+      - name: Terraform Init (Bootstrap)
+        working-directory: bootstrap
+        run: terraform init
+        
+      - name: Terraform Destroy (Bootstrap)
+        working-directory: bootstrap
+        run: terraform destroy -auto-approve
+        
+      # Clean up remaining resources
+      - name: Clean Up Resources
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          BUCKET_NAME="${TF_STATE_BUCKET}"
+          TABLE_NAME="${TF_LOCK_TABLE}"
+          
+          echo "Removing SSM Parameters..."
+          aws ssm delete-parameter --name "/terraform/$ENV/state_bucket" || true
+          aws ssm delete-parameter --name "/terraform/$ENV/lock_table" || true
+          
+          echo "Checking for bucket and table cleanup..."
+          
+          # Final check for S3 bucket
+          if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            echo "Cleaning up S3 bucket $BUCKET_NAME..."
+            aws s3 rm s3://$BUCKET_NAME --recursive
+            aws s3api delete-bucket --bucket $BUCKET_NAME
+            echo "Bucket deleted"
+          fi
+          
+          # Final check for DynamoDB table
+          if aws dynamodb describe-table --table-name "$TABLE_NAME" 2>/dev/null; then
+            echo "Cleaning up DynamoDB table $TABLE_NAME..."
+            aws dynamodb delete-table --table-name $TABLE_NAME
+            echo "Table deletion initiated"
+          fi
+          
+          echo "Destruction process completed."
