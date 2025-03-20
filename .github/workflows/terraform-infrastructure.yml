@@ -6,12 +6,14 @@ on:
       - main
     paths:
       - 'Terraform/**'
+      - 'bootstrap/**'
       - '.github/workflows/terraform-infrastructure.yml'
   pull_request:
     branches:
       - main
     paths:
       - 'Terraform/**'
+      - 'bootstrap/**'
   workflow_dispatch:
     inputs:
       environment:
@@ -28,9 +30,6 @@ jobs:
   terraform:
     name: Terraform Deployment
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: Terraform
     
     steps:
       - name: Checkout Repository
@@ -53,25 +52,58 @@ jobs:
           DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
           echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
           echo "TF_VAR_environment=$DEPLOY_ENV" >> $GITHUB_ENV
+          echo "PROJECT_NAME=neo4j-demos" >> $GITHUB_ENV
+
+      # Bootstrap terraform state infrastructure
+      - name: Bootstrap Terraform State
+        working-directory: bootstrap
+        run: |
+          # Run bootstrap terraform
+          terraform init
+          terraform apply -auto-approve -var="environment=${{ env.DEPLOY_ENV }}" -var="project_name=${{ env.PROJECT_NAME }}" -var="aws_region=${{ secrets.AWS_REGION || 'us-west-2' }}"
+          
+          # Save the outputs for main terraform
+          echo "TF_STATE_BUCKET=$(terraform output -raw state_bucket_name)" >> $GITHUB_ENV
+          echo "TF_LOCK_TABLE=$(terraform output -raw dynamodb_table_name)" >> $GITHUB_ENV
+
+      - name: Update Main Terraform Backend Config
+        working-directory: Terraform
+        run: |
+          # Update the terraform block to use S3 backend
+          if ! grep -q "backend \"s3\"" main.tf; then
+            # Add backend config if it doesn't exist
+            awk '/terraform {/,/}/{if(!/}/)print; else print "  backend \"s3\" {}\n}"; next}1' main.tf > tmp.tf && mv tmp.tf main.tf
+          fi
 
       - name: Terraform Init
-        run: terraform init
+        working-directory: Terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.DEPLOY_ENV }}/terraform.tfstate" \
+            -backend-config="region=${{ secrets.AWS_REGION || 'us-west-2' }}" \
+            -backend-config="dynamodb_table=${{ env.TF_LOCK_TABLE }}"
 
       - name: Terraform Format
+        working-directory: Terraform
         run: terraform fmt -check || true
 
       - name: Terraform Validate
+        working-directory: Terraform
         run: terraform validate
 
       - name: Terraform Plan
+        working-directory: Terraform
         run: terraform plan -out=tfplan
 
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        working-directory: Terraform
         run: terraform apply -auto-approve tfplan
 
       - name: Save Terraform Outputs to SSM
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        working-directory: Terraform
         run: |
           # Extract the cluster name from terraform output
           CLUSTER_NAME=$(terraform output -raw eks_cluster_name 2>/dev/null || echo "neo4j-demo-cluster")
@@ -104,7 +136,3 @@ jobs:
             --type "String" \
             --overwrite
           echo "Saved domain name ($DOMAIN_NAME) to SSM parameter store"
-
-
-
-#test2

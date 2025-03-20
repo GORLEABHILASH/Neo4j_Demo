@@ -4,6 +4,10 @@ provider "aws" {
 
 # Explicitly set the AWS provider version
 terraform {
+  backend "s3" {
+   
+  }
+  
   required_providers {
     aws = {
       source  = "hashicorp/aws"
