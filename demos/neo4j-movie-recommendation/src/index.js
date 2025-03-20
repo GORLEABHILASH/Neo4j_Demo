@@ -27,30 +27,353 @@ app.get('/health', (req, res) => {
 });
 
 // Add this to index.js before the API routes
-app.get('/', (req, res) => {
-  res.send(`
-    <html>
+// Replace the existing app.get('/') route with this code
+import { runQuery } from './neo4j.js';
+
+// Add this function to fetch data for the dashboard
+async function getDashboardData() {
+  try {
+    // Get genre counts
+    const genreResult = await runQuery(`
+      MATCH (g:Genre)<-[:IN_GENRE]-(m:Movie)
+      RETURN g.name AS genre, COUNT(m) AS movieCount
+      ORDER BY movieCount DESC
+      LIMIT 6
+    `);
+    
+    const genres = genreResult.records.map(record => ({
+      name: record.get('genre'),
+      count: record.get('movieCount').toNumber()
+    }));
+    
+    // Get latest movies
+    const latestMoviesResult = await runQuery(`
+      MATCH (m:Movie)
+      RETURN m.title AS title, m.released AS released, m.poster_image AS posterImage, m.tagline AS tagline
+      ORDER BY m.released DESC
+      LIMIT 6
+    `);
+    
+    const latestMovies = latestMoviesResult.records.map(record => ({
+      title: record.get('title'),
+      released: record.get('released'),
+      posterImage: record.get('posterImage'),
+      tagline: record.get('tagline')
+    }));
+    
+    // Get actor counts
+    const actorResult = await runQuery(`
+      MATCH (p:Person)-[:ACTED_IN]->(m:Movie)
+      WITH p, COUNT(m) AS movieCount
+      RETURN p.name AS name, p.profile_image AS profileImage, movieCount
+      ORDER BY movieCount DESC
+      LIMIT 6
+    `);
+    
+    const topActors = actorResult.records.map(record => ({
+      name: record.get('name'),
+      profileImage: record.get('profileImage'),
+      movieCount: record.get('movieCount').toNumber()
+    }));
+    
+    // Get total counts for dashboard stats
+    const countResult = await runQuery(`
+      MATCH (m:Movie)
+      WITH COUNT(m) AS movieCount
+      MATCH (p:Person)
+      WITH movieCount, COUNT(p) AS personCount
+      MATCH (g:Genre)
+      RETURN movieCount, personCount, COUNT(g) AS genreCount
+    `);
+    
+    const counts = {
+      movies: countResult.records[0].get('movieCount').toNumber(),
+      people: countResult.records[0].get('personCount').toNumber(),
+      genres: countResult.records[0].get('genreCount').toNumber()
+    };
+    
+    return {
+      genres,
+      latestMovies,
+      topActors,
+      counts
+    };
+  } catch (error) {
+    console.error('Error fetching dashboard data:', error);
+    return {
+      genres: [],
+      latestMovies: [],
+      topActors: [],
+      counts: { movies: 0, people: 0, genres: 0 }
+    };
+  }
+}
+
+// Update the route handler for the landing page
+app.get('/', async (req, res) => {
+  try {
+    const dashboardData = await getDashboardData();
+    
+    res.send(`
+      <!DOCTYPE html>
+      <html lang="en">
       <head>
-        <title>Neo4j Movie Recommendation API</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Neo4j Movie Recommendation Dashboard</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
         <style>
-          body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
-          h1 { color: #333; }
-          code { background-color: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
+          :root {
+            --neo4j-green: #018BFF;
+            --neo4j-dark: #2A2C34;
+          }
+          body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f8f9fa;
+            color: #333;
+            padding-bottom: 2rem;
+          }
+          .navbar {
+            background-color: var(--neo4j-dark);
+          }
+          .logo {
+            font-size: 1.8rem;
+            font-weight: bold;
+            color: white;
+          }
+          .logo span {
+            color: var(--neo4j-green);
+          }
+          .header-container {
+            background-color: var(--neo4j-dark);
+            color: white;
+            padding: 2rem 0;
+            margin-bottom: 2rem;
+          }
+          .stat-card {
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s ease;
+            height: 100%;
+          }
+          .stat-card:hover {
+            transform: translateY(-5px);
+          }
+          .card-header {
+            border-radius: 10px 10px 0 0 !important;
+            font-weight: bold;
+          }
+          .genre-badge {
+            background-color: var(--neo4j-green);
+            font-size: 0.9em;
+            margin-right: 0.5rem;
+            margin-bottom: 0.5rem;
+          }
+          .movie-card, .actor-card {
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s ease;
+            height: 100%;
+          }
+          .movie-card:hover, .actor-card:hover {
+            transform: translateY(-5px);
+          }
+          .movie-poster {
+            height: 250px;
+            object-fit: cover;
+            border-radius: 10px 10px 0 0;
+          }
+          .api-section {
+            background-color: #f0f0f0;
+            border-radius: 10px;
+            padding: 1.5rem;
+            margin-top: 2rem;
+          }
+          .stat-icon {
+            font-size: 2.5rem;
+            color: var(--neo4j-green);
+          }
+          .profile-image {
+            width: 70px;
+            height: 70px;
+            object-fit: cover;
+            border-radius: 50%;
+          }
         </style>
       </head>
       <body>
-        <h1>Neo4j Movie Recommendation API</h1>
-        <p>Available endpoints:</p>
-        <ul>
-          <li><code>GET /api/genres</code> - Get all movie genres</li>
-          <li><code>GET /api/movies/by-genre/:genre</code> - Get movies by genre</li>
-          <li><code>GET /api/movies/:title</code> - Get movie details including cast</li>
-          <li><code>GET /api/movies/:title/recommendations</code> - Get recommended movies</li>
-          <li><code>GET /api/search?q=query</code> - Search movies by title</li>
-        </ul>
+        <!-- Navbar with Neo4j branding -->
+        <nav class="navbar navbar-expand-lg navbar-dark">
+          <div class="container">
+            <span class="logo"><span>Neo4j</span> Movie Graph</span>
+          </div>
+        </nav>
+        
+        <!-- Header with dashboard overview -->
+        <div class="header-container">
+          <div class="container">
+            <div class="row align-items-center">
+              <div class="col-md-8">
+                <h1>Movie Recommendation Engine</h1>
+                <p class="lead">Powered by Neo4j Graph Database</p>
+                <p>Explore relationships between movies, actors, and genres with graph-based recommendations</p>
+              </div>
+              <div class="col-md-4 text-center">
+                <img src="https://dist.neo4j.com/wp-content/uploads/20210423072633/neo4j-logo-2020-1.svg" alt="Neo4j Logo" style="max-width: 200px;">
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Dashboard Stats -->
+        <div class="container mb-5">
+          <h2 class="mb-4">Database Overview</h2>
+          <div class="row">
+            <div class="col-md-4 mb-4">
+              <div class="card stat-card">
+                <div class="card-body text-center">
+                  <i class="bi bi-film stat-icon mb-3"></i>
+                  <h3>${dashboardData.counts.movies}</h3>
+                  <h5>Movies</h5>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4 mb-4">
+              <div class="card stat-card">
+                <div class="card-body text-center">
+                  <i class="bi bi-people stat-icon mb-3"></i>
+                  <h3>${dashboardData.counts.people}</h3>
+                  <h5>People</h5>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4 mb-4">
+              <div class="card stat-card">
+                <div class="card-body text-center">
+                  <i class="bi bi-tags stat-icon mb-3"></i>
+                  <h3>${dashboardData.counts.genres}</h3>
+                  <h5>Genres</h5>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Latest Movies -->
+        <div class="container mb-5">
+          <h2 class="mb-4">Latest Movies</h2>
+          <div class="row">
+            ${dashboardData.latestMovies.map(movie => `
+              <div class="col-md-4 mb-4">
+                <div class="card movie-card">
+                  <img src="${movie.posterImage || 'https://via.placeholder.com/350x250?text=No+Image'}" 
+                       class="movie-poster" alt="${movie.title}">
+                  <div class="card-body">
+                    <h5 class="card-title">${movie.title}</h5>
+                    <h6 class="card-subtitle mb-2 text-muted">${movie.released}</h6>
+                    <p class="card-text">${movie.tagline || 'No tagline available'}</p>
+                  </div>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+        
+        <!-- Popular Genres -->
+        <div class="container mb-5">
+          <h2 class="mb-4">Popular Genres</h2>
+          <div class="row">
+            ${dashboardData.genres.map(genre => `
+              <div class="col-md-4 mb-4">
+                <div class="card stat-card">
+                  <div class="card-header bg-light">
+                    ${genre.name}
+                  </div>
+                  <div class="card-body text-center">
+                    <h4 class="card-title">${genre.count}</h4>
+                    <p class="card-text">Movies in this genre</p>
+                    <a href="/api/movies/by-genre/${genre.name}" class="btn btn-sm btn-outline-primary">View Movies</a>
+                  </div>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+        
+        <!-- Top Actors -->
+        <div class="container mb-5">
+          <h2 class="mb-4">Featured Actors</h2>
+          <div class="row">
+            ${dashboardData.topActors.map(actor => `
+              <div class="col-md-4 mb-4">
+                <div class="card actor-card">
+                  <div class="card-body d-flex align-items-center">
+                    <div class="me-3">
+                      <img src="${actor.profileImage || 'https://via.placeholder.com/70x70?text=No+Image'}" 
+                           class="profile-image" alt="${actor.name}">
+                    </div>
+                    <div>
+                      <h5 class="card-title">${actor.name}</h5>
+                      <p class="card-text">${actor.movieCount} ${actor.movieCount === 1 ? 'movie' : 'movies'} in database</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        </div>
+        
+        <!-- API Reference -->
+        <div class="container">
+          <div class="api-section">
+            <h2 class="mb-4">API Reference</h2>
+            <div class="row">
+              <div class="col-md-6">
+                <div class="card mb-3">
+                  <div class="card-body">
+                    <h5><code>GET /api/genres</code></h5>
+                    <p class="mb-0">Get all movie genres</p>
+                  </div>
+                </div>
+                <div class="card mb-3">
+                  <div class="card-body">
+                    <h5><code>GET /api/movies/by-genre/:genre</code></h5>
+                    <p class="mb-0">Get movies by genre</p>
+                  </div>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="card mb-3">
+                  <div class="card-body">
+                    <h5><code>GET /api/movies/:title</code></h5>
+                    <p class="mb-0">Get movie details including cast</p>
+                  </div>
+                </div>
+                <div class="card mb-3">
+                  <div class="card-body">
+                    <h5><code>GET /api/movies/:title/recommendations</code></h5>
+                    <p class="mb-0">Get recommended movies</p>
+                  </div>
+                </div>
+                <div class="card mb-3">
+                  <div class="card-body">
+                    <h5><code>GET /api/search?q=query</code></h5>
+                    <p class="mb-0">Search movies by title</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
       </body>
-    </html>
-  `);
+      </html>
+    `);
+  } catch (error) {
+    logger.error('Error rendering dashboard:', error);
+    res.status(500).send('Error loading dashboard');
+  }
 });
 
 app.get('/ready', async (req, res) => {

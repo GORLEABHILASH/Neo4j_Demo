@@ -502,8 +502,7 @@ jobs:
               alb.ingress.kubernetes.io/group.name: "neo4j-demos-{{ENVIRONMENT}}"
           spec:
             rules:
-            - host: {{DEMO_NAME}}.{{DOMAIN_NAME}}
-              http:
+            - http:
                 paths:
                 - path: /
                   pathType: Prefix
