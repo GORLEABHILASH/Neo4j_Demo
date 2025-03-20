@@ -155,344 +155,483 @@ async function getDashboardData() {
 }
 
 // Update the route handler for the landing page
+// Replace the existing app.get('/') route with this complete implementation
+// This version includes proper error handling and database seeding
+
 app.get('/', async (req, res) => {
+  // Initialize default empty data structures
+  let movieData = {
+    genres: [],
+    latestMovies: [],
+    topActors: [],
+    counts: { movies: 0, people: 0, genres: 0 }
+  };
+  
   try {
-    // Import required modules
-    const { logger } = await import('./utils/logger.js');
-    const dashboardData = await getDashboardData();
+    // Check if database is empty and needs seeding
+    const nodeCountResult = await runQuery('MATCH (n) RETURN count(n) as count');
+    const nodeCount = nodeCountResult.records[0].get('count').toNumber();
     
-    res.send(`
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Neo4j Movie Recommendation Dashboard</title>
-        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
-        <style>
-          :root {
-            --neo4j-green: #018BFF;
-            --neo4j-dark: #2A2C34;
-          }
-          body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #f8f9fa;
-            color: #333;
-            padding-bottom: 2rem;
-          }
-          .navbar {
-            background-color: var(--neo4j-dark);
-          }
-          .logo {
-            font-size: 1.8rem;
-            font-weight: bold;
-            color: white;
-          }
-          .logo span {
-            color: var(--neo4j-green);
-          }
-          .header-container {
-            background-color: var(--neo4j-dark);
-            color: white;
-            padding: 2rem 0;
-            margin-bottom: 2rem;
-          }
-          .stat-card {
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            transition: transform 0.3s ease;
-            height: 100%;
-          }
-          .stat-card:hover {
-            transform: translateY(-5px);
-          }
-          .card-header {
-            border-radius: 10px 10px 0 0 !important;
-            font-weight: bold;
-          }
-          .genre-badge {
-            background-color: var(--neo4j-green);
-            font-size: 0.9em;
-            margin-right: 0.5rem;
-            margin-bottom: 0.5rem;
-          }
-          .movie-card, .actor-card {
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            transition: transform 0.3s ease;
-            height: 100%;
-          }
-          .movie-card:hover, .actor-card:hover {
-            transform: translateY(-5px);
-          }
-          .movie-poster {
-            height: 250px;
-            object-fit: cover;
-            border-radius: 10px 10px 0 0;
-          }
-          .api-section {
-            background-color: #f0f0f0;
-            border-radius: 10px;
-            padding: 1.5rem;
-            margin-top: 2rem;
-          }
-          .stat-icon {
-            font-size: 2.5rem;
-            color: var(--neo4j-green);
-          }
-          .profile-image {
-            width: 70px;
-            height: 70px;
-            object-fit: cover;
-            border-radius: 50%;
-          }
-        </style>
-      </head>
-      <body>
-        <!-- Navbar with Neo4j branding -->
-        <nav class="navbar navbar-expand-lg navbar-dark">
-          <div class="container">
-            <span class="logo"><span>Neo4j</span> Movie Graph</span>
-          </div>
-        </nav>
+    // If database is empty, seed it
+    if (nodeCount === 0) {
+      logger.info('Database is empty. Running seed function...');
+      try {
+        await seedDatabase();
+        logger.info('Database was empty, seeded successfully');
+      } catch (seedError) {
+        logger.error('Error seeding database:', seedError);
+        throw new Error('Failed to seed database: ' + seedError.message);
+      }
+    }
+    
+    // Fetch movie counts after potential seeding
+    const movieCountResult = await runQuery('MATCH (m:Movie) RETURN COUNT(m) AS count');
+    movieData.counts.movies = movieCountResult.records[0].get('count').toNumber();
+    
+    // Only proceed with other queries if we have movies
+    if (movieData.counts.movies > 0) {
+      // Fetch people count
+      const peopleCountResult = await runQuery('MATCH (p:Person) RETURN COUNT(p) AS count');
+      movieData.counts.people = peopleCountResult.records[0].get('count').toNumber();
+      
+      // Fetch genre count
+      const genreCountResult = await runQuery('MATCH (g:Genre) RETURN COUNT(g) AS count');
+      movieData.counts.genres = genreCountResult.records[0].get('count').toNumber();
+      
+      // Fetch genre data
+      if (movieData.counts.genres > 0) {
+        const genreResult = await runQuery(`
+          MATCH (g:Genre)<-[:IN_GENRE]-(m:Movie)
+          RETURN g.name AS genre, COUNT(m) AS movieCount
+          ORDER BY movieCount DESC
+          LIMIT 6
+        `);
         
-        <!-- Header with dashboard overview -->
-                  <div class="header-container">
-          <div class="container">
-            <div class="row align-items-center">
-              <div class="col-md-8">
-                <h1>Movie Recommendation Engine</h1>
-                <p class="lead">Powered by Neo4j Graph Database</p>
-                <p>Explore relationships between movies, actors, and genres with graph-based recommendations</p>
-                
-                <!-- Search Form -->
-                <div class="mt-4">
-                  <form action="/api/search" method="GET" class="d-flex">
-                    <input type="text" name="q" class="form-control" placeholder="Search for a movie..." required>
-                    <button type="submit" class="btn btn-light ms-2">
-                      <i class="bi bi-search"></i> Search
-                    </button>
-                  </form>
-                </div>
-              </div>
-              <div class="col-md-4 text-center">
-                <img src="https://dist.neo4j.com/wp-content/uploads/20210423072633/neo4j-logo-2020-1.svg" alt="Neo4j Logo" style="max-width: 200px;">
-              </div>
-            </div>
-          </div>
-        </div>
-        
-        <!-- Dashboard Stats -->
-        <div class="container mb-5">
-          <h2 class="mb-4">Database Overview</h2>
-          <div class="row">
-            <div class="col-md-4 mb-4">
-              <div class="card stat-card">
-                <div class="card-body text-center">
-                  <i class="bi bi-film stat-icon mb-3"></i>
-                  <h3>${dashboardData.counts.movies}</h3>
-                  <h5>Movies</h5>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-4 mb-4">
-              <div class="card stat-card">
-                <div class="card-body text-center">
-                  <i class="bi bi-people stat-icon mb-3"></i>
-                  <h3>${dashboardData.counts.people}</h3>
-                  <h5>People</h5>
-                </div>
-              </div>
-            </div>
-            <div class="col-md-4 mb-4">
-              <div class="card stat-card">
-                <div class="card-body text-center">
-                  <i class="bi bi-tags stat-icon mb-3"></i>
-                  <h3>${dashboardData.counts.genres}</h3>
-                  <h5>Genres</h5>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-        
-        <!-- Latest Movies -->
-        <div class="container mb-5">
-          <h2 class="mb-4">Latest Movies</h2>
-          <div class="row">
-            ${dashboardData.latestMovies.map(movie => `
-              <div class="col-md-4 mb-4">
-                <div class="card movie-card">
-                  <img src="${movie.posterImage || 'https://via.placeholder.com/350x250?text=No+Image'}" 
-                       class="movie-poster" alt="${movie.title}">
-                  <div class="card-body">
-                    <h5 class="card-title">${movie.title}</h5>
-                    <h6 class="card-subtitle mb-2 text-muted">${movie.released}</h6>
-                    <p class="card-text">${movie.tagline || 'No tagline available'}</p>
-                  </div>
-                </div>
-              </div>
-            `).join('')}
-          </div>
-        </div>
-        
-        <!-- Popular Genres -->
-        <div class="container mb-5">
-          <h2 class="mb-4">Popular Genres</h2>
-          <div class="row">
-            ${dashboardData.genres.map(genre => `
-              <div class="col-md-4 mb-4">
-                <div class="card stat-card">
-                  <div class="card-header bg-light">
-                    ${genre.name}
-                  </div>
-                  <div class="card-body text-center">
-                    <h4 class="card-title">${genre.count}</h4>
-                    <p class="card-text">Movies in this genre</p>
-                    <a href="/api/movies/by-genre/${genre.name}" class="btn btn-sm btn-outline-primary">View Movies</a>
-                  </div>
-                </div>
-              </div>
-            `).join('')}
-          </div>
-        </div>
-        
-        <!-- Top Actors -->
-        <div class="container mb-5">
-          <h2 class="mb-4">Featured Actors</h2>
-          <div class="row">
-            ${dashboardData.topActors.map(actor => `
-              <div class="col-md-4 mb-4">
-                <div class="card actor-card">
-                  <div class="card-body d-flex align-items-center">
-                    <div class="me-3">
-                      <img src="${actor.profileImage || 'https://via.placeholder.com/70x70?text=No+Image'}" 
-                           class="profile-image" alt="${actor.name}">
-                    </div>
-                    <div>
-                      <h5 class="card-title">${actor.name}</h5>
-                      <p class="card-text">${actor.movieCount} ${actor.movieCount === 1 ? 'movie' : 'movies'} in database</p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            `).join('')}
-          </div>
-        </div>
-        
-        <!-- Graph Visualization -->
-        <div class="container mb-5">
-          <h2 class="mb-4">Graph Visualization</h2>
-          <div class="card">
-            <div class="card-body">
-              <div class="text-center mb-3">
-                <img src="https://dist.neo4j.com/wp-content/uploads/20231106123052/graph-visualization.png" 
-                     alt="Neo4j Graph Visualization" 
-                     style="max-width: 100%; height: auto; border-radius: 8px;">
-              </div>
-              <h5 class="text-center">Neo4j Movie Database Schema</h5>
-              <p class="text-center">This graph shows how movies, actors, and genres are connected in our database.</p>
-              <div class="row mt-3">
-                <div class="col-md-4">
-                  <div class="card bg-light">
-                    <div class="card-body text-center">
-                      <i class="bi bi-film text-primary mb-2" style="font-size: 1.5rem;"></i>
-                      <h6>Movie Nodes</h6>
-                      <p class="small mb-0">Contain title, release year, and tagline</p>
-                    </div>
-                  </div>
-                </div>
-                <div class="col-md-4">
-                  <div class="card bg-light">
-                    <div class="card-body text-center">
-                      <i class="bi bi-people text-success mb-2" style="font-size: 1.5rem;"></i>
-                      <h6>Person Nodes</h6>
-                      <p class="small mb-0">Actors who starred in movies</p>
-                    </div>
-                  </div>
-                </div>
-                <div class="col-md-4">
-                  <div class="card bg-light">
-                    <div class="card-body text-center">
-                      <i class="bi bi-tags text-danger mb-2" style="font-size: 1.5rem;"></i>
-                      <h6>Genre Nodes</h6>
-                      <p class="small mb-0">Categories that classify movies</p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-        
-        <!-- API Reference -->
-        <div class="container">
-          <div class="api-section">
-            <h2 class="mb-4">API Reference</h2>
-            <div class="row">
-              <div class="col-md-6">
-                <div class="card mb-3">
-                  <div class="card-body">
-                    <h5><code>GET /api/genres</code></h5>
-                    <p class="mb-0">Get all movie genres</p>
-                    <a href="/api/genres" class="btn btn-sm btn-outline-primary mt-2">Try it</a>
-                  </div>
-                </div>
-                <div class="card mb-3">
-                  <div class="card-body">
-                    <h5><code>GET /api/movies/by-genre/:genre</code></h5>
-                    <p class="mb-0">Get movies by genre</p>
-                    <div class="mt-2">
-                      <a href="/api/movies/by-genre/Action" class="btn btn-sm btn-outline-primary">Action</a>
-                      <a href="/api/movies/by-genre/Science%20Fiction" class="btn btn-sm btn-outline-primary">Sci-Fi</a>
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <div class="col-md-6">
-                <div class="card mb-3">
-                  <div class="card-body">
-                    <h5><code>GET /api/movies/:title</code></h5>
-                    <p class="mb-0">Get movie details including cast</p>
-                    <div class="mt-2">
-                      <a href="/api/movies/The%20Matrix" class="btn btn-sm btn-outline-primary">The Matrix</a>
-                      <a href="/api/movies/Inception" class="btn btn-sm btn-outline-primary">Inception</a>
-                    </div>
-                  </div>
-                </div>
-                <div class="card mb-3">
-                  <div class="card-body">
-                    <h5><code>GET /api/movies/:title/recommendations</code></h5>
-                    <p class="mb-0">Get recommended movies</p>
-                    <div class="mt-2">
-                      <a href="/api/movies/The%20Matrix/recommendations" class="btn btn-sm btn-outline-primary">Matrix Recs</a>
-                      <a href="/api/movies/Interstellar/recommendations" class="btn btn-sm btn-outline-primary">Interstellar Recs</a>
-                    </div>
-                  </div>
-                </div>
-                <div class="card mb-3">
-                  <div class="card-body">
-                    <h5><code>GET /api/search?q=query</code></h5>
-                    <p class="mb-0">Search movies by title</p>
-                    <div class="mt-2">
-                      <a href="/api/search?q=dark" class="btn btn-sm btn-outline-primary">Search "dark"</a>
-                      <a href="/api/search?q=inter" class="btn btn-sm btn-outline-primary">Search "inter"</a>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-        
-        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-      </body>
-      </html>
-    `);
+        movieData.genres = genreResult.records.map(record => ({
+          name: record.get('genre'),
+          count: typeof record.get('movieCount') === 'object' ? 
+                record.get('movieCount').toNumber() : record.get('movieCount')
+        }));
+      }
+      
+      // Fetch latest movies
+      const latestMoviesResult = await runQuery(`
+        MATCH (m:Movie)
+        RETURN m.title AS title, m.released AS released, m.poster_image AS posterImage, m.tagline AS tagline
+        ORDER BY m.released DESC
+        LIMIT 6
+      `);
+      
+      movieData.latestMovies = latestMoviesResult.records.map(record => ({
+        title: record.get('title'),
+        released: record.get('released'),
+        posterImage: record.get('posterImage'),
+        tagline: record.get('tagline')
+      }));
+      
+      // Fetch top actors
+      const actorResult = await runQuery(`
+        MATCH (p:Person)-[:ACTED_IN]->(m:Movie)
+        WITH p, COUNT(m) AS movieCount
+        RETURN p.name AS name, p.profile_image AS profileImage, movieCount
+        ORDER BY movieCount DESC
+        LIMIT 6
+      `);
+      
+      movieData.topActors = actorResult.records.map(record => ({
+        name: record.get('name'),
+        profileImage: record.get('profileImage'),
+        movieCount: typeof record.get('movieCount') === 'object' ? 
+                  record.get('movieCount').toNumber() : record.get('movieCount')
+      }));
+    } else {
+      logger.warn('No movies found in database after seeding');
+      res.status(500).send('Database error: No movies found after seeding. Please check your seed function.');
+      return;
+    }
   } catch (error) {
-    logger.error('Error rendering dashboard:', error);
-    res.status(500).send('Error loading dashboard');
+    logger.error('Error fetching dashboard data:', error);
+    
+    // For development, show error details
+    if (process.env.NODE_ENV !== 'production') {
+      res.status(500).send(`
+        <h1>Database Error</h1>
+        <p>There was an error connecting to the Neo4j database:</p>
+        <pre>${error.message}</pre>
+        <p>Please check your Neo4j connection or server logs for more details.</p>
+        <p><a href="/db-status">Check Database Status</a></p>
+      `);
+      return;
+    }
+    
+    // For production, show generic error
+    res.status(500).send(`
+      <h1>Service Temporarily Unavailable</h1>
+      <p>We're experiencing technical difficulties. Please try again later.</p>
+    `);
+    return;
   }
+  
+  // Render the dashboard HTML
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Neo4j Movie Recommendation Dashboard</title>
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+      <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+      <style>
+        :root {
+          --neo4j-green: #018BFF;
+          --neo4j-dark: #2A2C34;
+        }
+        body {
+          font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+          background-color: #f8f9fa;
+          color: #333;
+          padding-bottom: 2rem;
+        }
+        .navbar {
+          background-color: var(--neo4j-dark);
+        }
+        .logo {
+          font-size: 1.8rem;
+          font-weight: bold;
+          color: white;
+        }
+        .logo span {
+          color: var(--neo4j-green);
+        }
+        .header-container {
+          background-color: var(--neo4j-dark);
+          color: white;
+          padding: 2rem 0;
+          margin-bottom: 2rem;
+        }
+        .stat-card {
+          border-radius: 10px;
+          box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+          transition: transform 0.3s ease;
+          height: 100%;
+        }
+        .stat-card:hover {
+          transform: translateY(-5px);
+        }
+        .card-header {
+          border-radius: 10px 10px 0 0 !important;
+          font-weight: bold;
+        }
+        .genre-badge {
+          background-color: var(--neo4j-green);
+          font-size: 0.9em;
+          margin-right: 0.5rem;
+          margin-bottom: 0.5rem;
+        }
+        .movie-card, .actor-card {
+          box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+          transition: transform 0.3s ease;
+          height: 100%;
+        }
+        .movie-card:hover, .actor-card:hover {
+          transform: translateY(-5px);
+        }
+        .movie-poster {
+          height: 250px;
+          object-fit: cover;
+          border-radius: 10px 10px 0 0;
+        }
+        .api-section {
+          background-color: #f0f0f0;
+          border-radius: 10px;
+          padding: 1.5rem;
+          margin-top: 2rem;
+        }
+        .stat-icon {
+          font-size: 2.5rem;
+          color: var(--neo4j-green);
+        }
+        .profile-image {
+          width: 70px;
+          height: 70px;
+          object-fit: cover;
+          border-radius: 50%;
+        }
+        .debug-info {
+          background-color: #f8f9fa;
+          border: 1px solid #ddd;
+          border-radius: 5px;
+          padding: 15px;
+          font-family: monospace;
+          font-size: 12px;
+          margin-top: 20px;
+        }
+      </style>
+    </head>
+    <body>
+      <!-- Navbar with Neo4j branding -->
+      <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container">
+          <span class="logo"><span>Neo4j</span> Movie Graph</span>
+        </div>
+      </nav>
+      
+      <!-- Header with dashboard overview -->
+      <div class="header-container">
+        <div class="container">
+          <div class="row align-items-center">
+            <div class="col-md-8">
+              <h1>Movie Recommendation Engine</h1>
+              <p class="lead">Powered by Neo4j Graph Database</p>
+              <p>Explore relationships between movies, actors, and genres with graph-based recommendations</p>
+              
+              <!-- Search Form -->
+              <div class="mt-4">
+                <form action="/api/search" method="GET" class="d-flex">
+                  <input type="text" name="q" class="form-control" placeholder="Search for a movie..." required>
+                  <button type="submit" class="btn btn-light ms-2">
+                    <i class="bi bi-search"></i> Search
+                  </button>
+                </form>
+              </div>
+            </div>
+            <div class="col-md-4 text-center">
+              <img src="https://dist.neo4j.com/wp-content/uploads/20210423072633/neo4j-logo-2020-1.svg" alt="Neo4j Logo" style="max-width: 200px;">
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Database Debug Information (only shown if there are issues) -->
+      ${movieData.counts.movies === 0 ? `
+      <div class="container mb-3">
+        <div class="alert alert-warning">
+          <h4><i class="bi bi-exclamation-triangle-fill"></i> Database Issue Detected</h4>
+          <p>The dashboard is having trouble loading data from Neo4j. Please check your database connection.</p>
+          <p><a href="/db-status" class="btn btn-sm btn-primary">Check Database Status</a></p>
+        </div>
+      </div>
+      ` : ''}
+      
+      <!-- Dashboard Stats -->
+      <div class="container mb-5">
+        <h2 class="mb-4">Database Overview</h2>
+        <div class="row">
+          <div class="col-md-4 mb-4">
+            <div class="card stat-card">
+              <div class="card-body text-center">
+                <i class="bi bi-film stat-icon mb-3"></i>
+                <h3>${movieData.counts.movies}</h3>
+                <h5>Movies</h5>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-4 mb-4">
+            <div class="card stat-card">
+              <div class="card-body text-center">
+                <i class="bi bi-people stat-icon mb-3"></i>
+                <h3>${movieData.counts.people}</h3>
+                <h5>People</h5>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-4 mb-4">
+            <div class="card stat-card">
+              <div class="card-body text-center">
+                <i class="bi bi-tags stat-icon mb-3"></i>
+                <h3>${movieData.counts.genres}</h3>
+                <h5>Genres</h5>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Latest Movies -->
+      <div class="container mb-5">
+        <h2 class="mb-4">Latest Movies</h2>
+        <div class="row">
+          ${movieData.latestMovies.map(movie => `
+            <div class="col-md-4 mb-4">
+              <div class="card movie-card">
+                <img src="${movie.posterImage || 'https://via.placeholder.com/350x250?text=No+Image'}" 
+                     class="movie-poster" alt="${movie.title}">
+                <div class="card-body">
+                  <h5 class="card-title">${movie.title}</h5>
+                  <h6 class="card-subtitle mb-2 text-muted">${movie.released}</h6>
+                  <p class="card-text">${movie.tagline || 'No tagline available'}</p>
+                </div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+      
+      <!-- Popular Genres -->
+      <div class="container mb-5">
+        <h2 class="mb-4">Popular Genres</h2>
+        <div class="row">
+          ${movieData.genres.map(genre => `
+            <div class="col-md-4 mb-4">
+              <div class="card stat-card">
+                <div class="card-header bg-light">
+                  ${genre.name}
+                </div>
+                <div class="card-body text-center">
+                  <h4 class="card-title">${genre.count}</h4>
+                  <p class="card-text">Movies in this genre</p>
+                  <a href="/api/movies/by-genre/${genre.name}" class="btn btn-sm btn-outline-primary">View Movies</a>
+                </div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+      
+      <!-- Top Actors -->
+      <div class="container mb-5">
+        <h2 class="mb-4">Featured Actors</h2>
+        <div class="row">
+          ${movieData.topActors.map(actor => `
+            <div class="col-md-4 mb-4">
+              <div class="card actor-card">
+                <div class="card-body d-flex align-items-center">
+                  <div class="me-3">
+                    <img src="${actor.profileImage || 'https://via.placeholder.com/70x70?text=No+Image'}" 
+                         class="profile-image" alt="${actor.name}">
+                  </div>
+                  <div>
+                    <h5 class="card-title">${actor.name}</h5>
+                    <p class="card-text">${actor.movieCount} ${actor.movieCount === 1 ? 'movie' : 'movies'} in database</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+      
+      <!-- Graph Visualization -->
+      <div class="container mb-5">
+        <h2 class="mb-4">Graph Visualization</h2>
+        <div class="card">
+          <div class="card-body">
+            <div class="text-center mb-3">
+              <img src="https://dist.neo4j.com/wp-content/uploads/20231106123052/graph-visualization.png" 
+                   alt="Neo4j Graph Visualization" 
+                   style="max-width: 100%; height: auto; border-radius: 8px;">
+            </div>
+            <h5 class="text-center">Neo4j Movie Database Schema</h5>
+            <p class="text-center">This graph shows how movies, actors, and genres are connected in our database.</p>
+            <div class="row mt-3">
+              <div class="col-md-4">
+                <div class="card bg-light">
+                  <div class="card-body text-center">
+                    <i class="bi bi-film text-primary mb-2" style="font-size: 1.5rem;"></i>
+                    <h6>Movie Nodes</h6>
+                    <p class="small mb-0">Contain title, release year, and tagline</p>
+                  </div>
+                </div>
+              </div>
+              <div class="col-md-4">
+                <div class="card bg-light">
+                  <div class="card-body text-center">
+                    <i class="bi bi-people text-success mb-2" style="font-size: 1.5rem;"></i>
+                    <h6>Person Nodes</h6>
+                    <p class="small mb-0">Actors who starred in movies</p>
+                  </div>
+                </div>
+              </div>
+              <div class="col-md-4">
+                <div class="card bg-light">
+                  <div class="card-body text-center">
+                    <i class="bi bi-tags text-danger mb-2" style="font-size: 1.5rem;"></i>
+                    <h6>Genre Nodes</h6>
+                    <p class="small mb-0">Categories that classify movies</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- API Links with Examples -->
+      <div class="container">
+        <div class="api-section">
+          <h2 class="mb-4">API Reference</h2>
+          <div class="row">
+            <div class="col-md-6">
+              <div class="card mb-3">
+                <div class="card-body">
+                  <h5><code>GET /api/genres</code></h5>
+                  <p class="mb-0">Get all movie genres</p>
+                  <a href="/api/genres" class="btn btn-sm btn-outline-primary mt-2">Try it</a>
+                </div>
+              </div>
+              <div class="card mb-3">
+                <div class="card-body">
+                  <h5><code>GET /api/movies/by-genre/:genre</code></h5>
+                  <p class="mb-0">Get movies by genre</p>
+                  <div class="mt-2">
+                    <a href="/api/movies/by-genre/Action" class="btn btn-sm btn-outline-primary">Action</a>
+                    <a href="/api/movies/by-genre/Science%20Fiction" class="btn btn-sm btn-outline-primary">Sci-Fi</a>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-6">
+              <div class="card mb-3">
+                <div class="card-body">
+                  <h5><code>GET /api/movies/:title</code></h5>
+                  <p class="mb-0">Get movie details including cast</p>
+                  <div class="mt-2">
+                    <a href="/api/movies/The%20Matrix" class="btn btn-sm btn-outline-primary">The Matrix</a>
+                    <a href="/api/movies/Inception" class="btn btn-sm btn-outline-primary">Inception</a>
+                  </div>
+                </div>
+              </div>
+              <div class="card mb-3">
+                <div class="card-body">
+                  <h5><code>GET /api/movies/:title/recommendations</code></h5>
+                  <p class="mb-0">Get recommended movies</p>
+                  <div class="mt-2">
+                    <a href="/api/movies/The%20Matrix/recommendations" class="btn btn-sm btn-outline-primary">Matrix Recs</a>
+                    <a href="/api/movies/Interstellar/recommendations" class="btn btn-sm btn-outline-primary">Interstellar Recs</a>
+                  </div>
+                </div>
+              </div>
+              <div class="card mb-3">
+                <div class="card-body">
+                  <h5><code>GET /api/search?q=query</code></h5>
+                  <p class="mb-0">Search movies by title</p>
+                  <div class="mt-2">
+                    <a href="/api/search?q=dark" class="btn btn-sm btn-outline-primary">Search "dark"</a>
+                    <a href="/api/search?q=inter" class="btn btn-sm btn-outline-primary">Search "inter"</a>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Debug links -->
+      ${process.env.NODE_ENV !== 'production' ? `
+      <div class="container mt-5">
+        <div class="d-flex justify-content-center">
+          <a href="/db-status" class="btn btn-outline-secondary me-2">Database Status</a>
+          <a href="/ready" class="btn btn-outline-secondary me-2">Check Readiness</a>
+          <a href="/health" class="btn btn-outline-secondary">Health Check</a>
+        </div>
+      </div>
+      ` : ''}
+      
+      <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    </body>
+    </html>
+  `);
 });
 
 app.get('/ready', async (req, res) => {
