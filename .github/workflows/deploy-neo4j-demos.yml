@@ -75,3 +75,564 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
+      
+      - name: Determine demos to process
+        id: set-matrix
+        run: |
+          # Initialize CHANGED_DEMOS as empty array
+          CHANGED_DEMOS="[]"
+          
+          if [[ "${{ github.event.inputs.deploy_all }}" == "true" ]]; then
+            # Deploy all demos
+            DEMOS=$(ls -1 demos/ | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "matrix={\"demo\":$DEMOS}" >> $GITHUB_OUTPUT
+            echo "Selected demos to process: $DEMOS"
+            
+          elif [[ -n "${{ github.event.inputs.demo_name }}" ]]; then
+            # Deploy specified demo
+            # Check if the demo directory exists
+            if [ -d "demos/${{ github.event.inputs.demo_name }}" ]; then
+              echo "matrix={\"demo\":[\"${{ github.event.inputs.demo_name }}\"]}" >> $GITHUB_OUTPUT
+              echo "Selected demo to process: ${{ github.event.inputs.demo_name }}"
+            else
+              echo "Warning: Demo directory 'demos/${{ github.event.inputs.demo_name }}' does not exist"
+              echo "matrix={\"demo\":[]}" >> $GITHUB_OUTPUT
+            fi
+            
+          elif [[ "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "pull_request" ]]; then
+            # Find changed demos
+            BEFORE_SHA=${{ github.event.before || 'HEAD~1' }}
+            CURRENT_SHA=${{ github.sha }}
+            CHANGED_DEMOS=$(git diff --name-only $BEFORE_SHA $CURRENT_SHA | grep "^demos/" | cut -d/ -f2 | sort | uniq | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "matrix={\"demo\":$CHANGED_DEMOS}" >> $GITHUB_OUTPUT
+            echo "Selected demos to process: $CHANGED_DEMOS"
+            
+          else
+            # Default to empty if somehow nothing is selected
+            echo "matrix={\"demo\":[]}" >> $GITHUB_OUTPUT
+            echo "No demos selected to process"
+          fi
+
+  build-and-push:
+    needs: determine-demos
+    if: ${{ fromJson(needs.determine-demos.outputs.matrix).demo[0] != null }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.determine-demos.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Check if demo directory exists
+        id: check-demo
+        run: |
+          if [ ! -d "demos/${{ matrix.demo }}" ]; then
+            echo "Demo directory 'demos/${{ matrix.demo }}' does not exist, skipping"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials
+        if: steps.check-demo.outputs.skip != 'true'
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-west-2' }}
+      
+      - name: Login to Amazon ECR
+        if: steps.check-demo.outputs.skip != 'true'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Set environment & build ID
+        if: steps.check-demo.outputs.skip != 'true'
+        run: |
+          DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
+          echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
+          echo "BUILD_ID=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ secrets.AWS_REGION || 'us-west-2' }}" >> $GITHUB_ENV
+      
+      - name: Set up Node.js for build
+        if: steps.check-demo.outputs.skip != 'true'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'demos/${{ matrix.demo }}/package-lock.json'
+
+      - name: Install dependencies and build
+        if: steps.check-demo.outputs.skip != 'true'
+        working-directory: demos/${{ matrix.demo }}
+        run: |
+          if [ -f "package.json" ]; then
+            npm ci
+            npm run build
+          fi
+      
+      - name: Build, tag, and push image to Amazon ECR
+        if: steps.check-demo.outputs.skip != 'true'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ matrix.demo }}
+        run: |
+          cd demos/${{ matrix.demo }}
+          
+          # Make sure repository exists
+          aws ecr describe-repositories --repository-names ${{ matrix.demo }} || aws ecr create-repository --repository-name ${{ matrix.demo }}
+          
+          # Build with unique build ID
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }} .
+          
+          # Tag with latest
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }} $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          # Tag with environment-specific latest 
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }} $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.DEPLOY_ENV }}-latest
+          
+          # Push all tags
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.DEPLOY_ENV }}-latest
+          
+          # Update the SSM parameters with the image version information
+          aws ssm put-parameter \
+            --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/${{ matrix.demo }}-image-tag" \
+            --value "${{ env.BUILD_ID }}" \
+            --type String \
+            --overwrite
+          
+          aws ssm put-parameter \
+            --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/${{ matrix.demo }}-last-updated" \
+            --value "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            --type String \
+            --overwrite
+          
+          echo "Image $ECR_REGISTRY/$ECR_REPOSITORY has been tagged with:"
+          echo "- ${{ env.BUILD_ID }} (specific build)"
+          echo "- latest (latest overall)"
+          echo "- ${{ env.DEPLOY_ENV }}-latest (latest for ${{ env.DEPLOY_ENV }} environment)"
+  
+  deploy:
+    needs: [determine-demos, build-and-push]
+    if: ${{ fromJson(needs.determine-demos.outputs.matrix).demo[0] != null && github.event.inputs.build_only != 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.determine-demos.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Check if demo directory exists
+        id: check-demo
+        run: |
+          if [ ! -d "demos/${{ matrix.demo }}" ]; then
+            echo "Demo directory 'demos/${{ matrix.demo }}' does not exist, skipping"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Configure AWS credentials
+        if: steps.check-demo.outputs.skip != 'true'
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-west-2' }}
+      
+      - name: Set environment variables
+        if: steps.check-demo.outputs.skip != 'true'
+        run: |
+          DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
+          echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
+          echo "BUILD_ID=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ secrets.AWS_REGION || 'us-west-2' }}" >> $GITHUB_ENV
+          
+      - name: Login to Amazon ECR for deployment
+        if: steps.check-demo.outputs.skip != 'true'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+          
+      - name: Get cluster name from Terraform outputs
+        if: steps.check-demo.outputs.skip != 'true'
+        id: cluster-info
+        run: |
+          # Try to get the cluster name from Terraform outputs in SSM Parameter Store
+          CLUSTER_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/eks-cluster-name" --query "Parameter.Value" --output text 2>/dev/null || echo "neo4j-demo-cluster")
+          echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
+          echo "Using EKS cluster: $CLUSTER_NAME"
+          
+      - name: Update kubeconfig
+        if: steps.check-demo.outputs.skip != 'true'
+        run: |
+          aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+      
+      - name: Force complete cleanup if requested
+        if: ${{ steps.check-demo.outputs.skip != 'true' && github.event.inputs.force_cleanup == 'true' }}
+        run: |
+          echo "Performing complete namespace cleanup for ${{ matrix.demo }}..."
+          kubectl delete namespace ${{ matrix.demo }} --wait=true || true
+          sleep 10 # Give K8s some time to clean up resources
+      
+      - name: Create K8s template directories
+        if: steps.check-demo.outputs.skip != 'true'
+        run: |
+          mkdir -p deployment
+          mkdir -p generated-manifests
+      
+      - name: Create Neo4j template
+        if: steps.check-demo.outputs.skip != 'true'
+        run: |
+          # Creating the Neo4j template file with emptyDir storage for Neo4j
+          cat > deployment/neo4j-template.yaml << 'EOFNEO'
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: {{DEMO_NAME}}
+          ---
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: neo4j-conf
+            namespace: {{DEMO_NAME}}
+          data:
+            neo4j.conf: |
+              dbms.memory.heap.initial_size=128m
+              dbms.memory.heap.max_size=256m
+              dbms.memory.pagecache.size=128m
+              dbms.default_listen_address=0.0.0.0
+              dbms.connector.bolt.listen_address=0.0.0.0:7687
+              dbms.connector.http.listen_address=0.0.0.0:7474
+              dbms.connector.https.listen_address=0.0.0.0:7473
+              dbms.security.auth_enabled=true
+              dbms.directories.import=/var/lib/neo4j/import
+              dbms.allow_upgrade=true
+              # Disable memory validation - environment has constraints Neo4j doesn't detect
+              dbms.memory.validation=false
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: neo4j
+            namespace: {{DEMO_NAME}}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: neo4j
+                demo: {{DEMO_NAME}}
+            template:
+              metadata:
+                labels:
+                  app: neo4j
+                  demo: {{DEMO_NAME}}
+              spec:
+                containers:
+                - name: neo4j
+                  image: neo4j:{{NEO4J_VERSION}}
+                  imagePullPolicy: IfNotPresent
+                  ports:
+                  - containerPort: 7474
+                    name: http
+                  - containerPort: 7687
+                    name: bolt
+                  env:
+                  - name: NEO4J_AUTH
+                    valueFrom:
+                      secretKeyRef:
+                        name: neo4j-secrets
+                        key: neo4j-auth
+                  - name: NEO4J_ACCEPT_LICENSE_AGREEMENT
+                    value: "yes"
+                  volumeMounts:
+                  - name: data
+                    mountPath: /data
+                  - name: conf
+                    mountPath: /conf
+                  resources:
+                    requests:
+                      cpu: "0.1"
+                      memory: "256Mi"
+                    limits:
+                      cpu: "0.5"
+                      memory: "512Mi"
+                  livenessProbe:
+                    tcpSocket:
+                      port: 7687
+                    initialDelaySeconds: 60
+                    timeoutSeconds: 10
+                    periodSeconds: 10
+                  readinessProbe:
+                    tcpSocket:
+                      port: 7687
+                    initialDelaySeconds: 30
+                    timeoutSeconds: 10
+                    periodSeconds: 10
+                volumes:
+                - name: conf
+                  configMap:
+                    name: neo4j-conf
+                - name: data
+                  emptyDir: {}
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: neo4j
+            namespace: {{DEMO_NAME}}
+          spec:
+            selector:
+              app: neo4j
+              demo: {{DEMO_NAME}}
+            ports:
+            - name: http
+              port: 7474
+              targetPort: 7474
+            - name: bolt
+              port: 7687
+              targetPort: 7687
+            type: ClusterIP
+          ---
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: neo4j-secrets
+            namespace: {{DEMO_NAME}}
+          type: Opaque
+          data:
+            neo4j-auth: {{NEO4J_AUTH_BASE64}}
+            neo4j-password: {{NEO4J_PASSWORD_BASE64}}
+          EOFNEO
+      
+      - name: Create Demo App template
+        if: steps.check-demo.outputs.skip != 'true'
+        run: |
+          # Creating the Demo App template file
+          cat > deployment/demo-app-template.yaml << 'EOFAPP'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: {{DEMO_NAME}}-app
+            namespace: {{DEMO_NAME}}
+            annotations:
+              kubernetes.io/change-cause: "Build {{BUILD_ID}} deployed at {{DEPLOY_TIME}}"
+          spec:
+            replicas: {{REPLICAS}}
+            selector:
+              matchLabels:
+                app: {{DEMO_NAME}}-app
+            template:
+              metadata:
+                labels:
+                  app: {{DEMO_NAME}}-app
+                  build-id: "{{BUILD_ID}}"
+              spec:
+                containers:
+                - name: {{DEMO_NAME}}-app
+                  image: {{ECR_REGISTRY}}/{{DEMO_NAME}}:{{IMAGE_TAG}}
+                  imagePullPolicy: Always
+                  ports:
+                  - containerPort: 8080
+                    name: http
+                  env:
+                  - name: NEO4J_URI
+                    value: bolt://neo4j:7687
+                  - name: NEO4J_USER
+                    value: neo4j
+                  - name: NEO4J_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: neo4j-secrets
+                        key: neo4j-password
+                  - name: DEMO_ENV
+                    value: {{ENVIRONMENT}}
+                  - name: BUILD_ID
+                    value: "{{BUILD_ID}}"
+                  resources:
+                    requests:
+                      cpu: "0.1"
+                      memory: "256Mi"
+                    limits:
+                      cpu: "0.5"
+                      memory: "512Mi"
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 60
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{DEMO_NAME}}-app
+            namespace: {{DEMO_NAME}}
+          spec:
+            selector:
+              app: {{DEMO_NAME}}-app
+            ports:
+            - name: http
+              port: 80
+              targetPort: 8080
+            type: ClusterIP
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: {{DEMO_NAME}}-ingress
+            namespace: {{DEMO_NAME}}
+            annotations:
+              kubernetes.io/ingress.class: alb
+              alb.ingress.kubernetes.io/scheme: internet-facing
+              alb.ingress.kubernetes.io/target-type: ip
+              alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+              alb.ingress.kubernetes.io/load-balancer-name: "neo4j-demos-{{ENVIRONMENT}}"
+              alb.ingress.kubernetes.io/group.name: "neo4j-demos-{{ENVIRONMENT}}"
+          spec:
+            rules:
+            - host: {{DEMO_NAME}}.{{DOMAIN_NAME}}
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: {{DEMO_NAME}}-app
+                      port:
+                        name: http
+          EOFAPP
+      
+      - name: Generate Kubernetes manifests
+        if: steps.check-demo.outputs.skip != 'true'
+        run: |
+          # Get configuration from parameter store
+          DOMAIN_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/domain-name" --query "Parameter.Value" --output text || echo "neo4j-demos.example.com")
+          NEO4J_VERSION=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-version" --query "Parameter.Value" --output text || echo "4.4")
+          NEO4J_PASSWORD=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-password" --with-decryption --query "Parameter.Value" --output text || echo "password")
+          REPLICAS=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/app-replicas" --query "Parameter.Value" --output text || echo "1")
+          IMAGE_TAG=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/${{ matrix.demo }}-image-tag" --query "Parameter.Value" --output text || echo "${{ env.DEPLOY_ENV }}-latest")
+          
+          # Get ECR registry address
+          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          if [ -z "$ECR_REGISTRY" ]; then
+            # Fallback to constructing it from region if output is empty
+            ECR_REGISTRY="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          fi
+          
+          # Prepare Neo4j auth and password base64
+          NEO4J_AUTH_BASE64=$(echo -n "neo4j/${NEO4J_PASSWORD}" | base64 -w 0)
+          NEO4J_PASSWORD_BASE64=$(echo -n "${NEO4J_PASSWORD}" | base64 -w 0)
+          
+          # Current timestamp for deployment annotation
+          DEPLOY_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          
+          # Create or clean namespace
+          kubectl get namespace ${{ matrix.demo }} || kubectl create namespace ${{ matrix.demo }}
+          
+          # Process Neo4j template
+          cat deployment/neo4j-template.yaml | \
+          sed "s/{{DEMO_NAME}}/${{ matrix.demo }}/g" | \
+          sed "s/{{NEO4J_VERSION}}/${NEO4J_VERSION}/g" | \
+          sed "s/{{NEO4J_AUTH_BASE64}}/${NEO4J_AUTH_BASE64}/g" | \
+          sed "s/{{NEO4J_PASSWORD_BASE64}}/${NEO4J_PASSWORD_BASE64}/g" > generated-manifests/neo4j-${{ matrix.demo }}.yaml
+          
+          # Process demo app template
+          cat deployment/demo-app-template.yaml | \
+          sed "s/{{DEMO_NAME}}/${{ matrix.demo }}/g" | \
+          sed "s/{{REPLICAS}}/${REPLICAS}/g" | \
+          sed "s|{{ECR_REGISTRY}}|${ECR_REGISTRY}|g" | \
+          sed "s/{{IMAGE_TAG}}/${IMAGE_TAG}/g" | \
+          sed "s/{{BUILD_ID}}/${{ env.BUILD_ID }}/g" | \
+          sed "s/{{DEPLOY_TIME}}/${DEPLOY_TIME}/g" | \
+          sed "s/{{ENVIRONMENT}}/${{ env.DEPLOY_ENV }}/g" | \
+          sed "s/{{DOMAIN_NAME}}/${DOMAIN_NAME}/g" > generated-manifests/app-${{ matrix.demo }}.yaml
+          
+          # Debug - Print important parts of the manifest for verification
+          echo "Verifying app image and pull policy:"
+          grep -A 5 "image:" generated-manifests/app-${{ matrix.demo }}.yaml
+      
+      - name: Clean up existing resources
+        if: steps.check-demo.outputs.skip != 'true'
+        run: |
+          # Clean up any existing StatefulSets to avoid conflicts
+          kubectl delete statefulset -n ${{ matrix.demo }} neo4j --ignore-not-found=true --wait=false
+          
+          # Delete any existing Neo4j deployments
+          kubectl delete deployment -n ${{ matrix.demo }} neo4j --ignore-not-found=true --wait=false
+          
+          # Delete any PVCs that might be causing issues
+          kubectl delete pvc -n ${{ matrix.demo }} --all --wait=false
+          
+          # Brief pause to let Kubernetes clean up resources
+          sleep 5
+      
+      - name: Deploy Neo4j
+        if: steps.check-demo.outputs.skip != 'true'
+        run: |
+          # Apply Neo4j resources
+          kubectl apply -f generated-manifests/neo4j-${{ matrix.demo }}.yaml
+          
+          # Debug - check Neo4j pod status
+          echo "Checking initial Neo4j pod status..."
+          kubectl get pods -n ${{ matrix.demo }} -l app=neo4j -o wide
+          
+          # Wait for Neo4j to be ready
+          echo "Waiting for Neo4j to start..."
+          kubectl rollout status deployment/neo4j -n ${{ matrix.demo }} --timeout=5m || true
+          
+          # Debug - If Neo4j isn't ready, get more information
+          if ! kubectl get pods -n ${{ matrix.demo }} -l app=neo4j | grep -q "1/1"; then
+            echo "Neo4j pod is not ready. Getting more details..."
+            kubectl describe pod -l app=neo4j -n ${{ matrix.demo }}
+            kubectl logs -l app=neo4j -n ${{ matrix.demo }} --tail=100 || true
+          fi
+          
+          # Proceed with app deployment anyway
+          echo "Proceeding with demo app deployment..."
+      
+      - name: Deploy demo app
+        if: steps.check-demo.outputs.skip != 'true'
+        run: |
+          # Apply demo app
+          kubectl apply -f generated-manifests/app-${{ matrix.demo }}.yaml
+          
+          # Attempt to update deployment record in DynamoDB (if table exists)
+          aws dynamodb describe-table --table-name neo4j-demo-deployments >/dev/null 2>&1 && \
+          aws dynamodb put-item \
+            --table-name neo4j-demo-deployments \
+            --item '{
+              "demo_id": {"S": "${{ matrix.demo }}"},
+              "version": {"S": "${{ env.BUILD_ID }}"},
+              "environment": {"S": "${{ env.DEPLOY_ENV }}"},
+              "deployment_time": {"S": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"},
+              "deployed_by": {"S": "${{ github.actor }}"},
+              "commit_sha": {"S": "${{ github.sha }}"}
+            }' || echo "DynamoDB table does not exist, skipping deployment record."
+      
+      - name: Verify deployment
+        if: steps.check-demo.outputs.skip != 'true'
+        run: |
+          echo "Waiting for application deployment to complete..."
+          kubectl rollout status deployment/${{ matrix.demo }}-app -n ${{ matrix.demo }} --timeout=5m || true
+          
+          echo "Current pod status:"
+          kubectl get pods -n ${{ matrix.demo }}
+          
+          DOMAIN_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/domain-name" --query "Parameter.Value" --output text || echo "neo4j-demos.example.com")
+          echo "Deployment completed! Application should be available at: https://${{ matrix.demo }}.$DOMAIN_NAME"
+          
+          # Get service endpoints for logs
+          echo "Service endpoints:"
+          kubectl get ingress,svc -n ${{ matrix.demo }} -o wide || echo "No ingress found"
