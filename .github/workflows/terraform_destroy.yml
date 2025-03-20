@@ -233,10 +233,41 @@ jobs:
           if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
             echo "VPC still exists: $VPC_ID. Performing manual cleanup..."
             
+            # List all VPC Endpoints and delete them
+            echo "Removing VPC Endpoints..."
+            ENDPOINTS=$(aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$VPC_ID" --query "VpcEndpoints[].VpcEndpointId" --output text)
+            for ENDPOINT in $ENDPOINTS; do
+              echo "Deleting VPC Endpoint: $ENDPOINT"
+              aws ec2 delete-vpc-endpoints --vpc-endpoint-ids $ENDPOINT || true
+            done
+            
+            # Delete all network ACLs except default
+            echo "Removing network ACLs..."
+            NACLS=$(aws ec2 describe-network-acls --filters "Name=vpc-id,Values=$VPC_ID" --query "NetworkAcls[?!IsDefault].NetworkAclId" --output text)
+            for NACL in $NACLS; do
+              aws ec2 delete-network-acl --network-acl-id $NACL || true
+            done
+            
             # Delete all security groups except default
             echo "Removing security groups..."
             SGs=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[?GroupName!='default'].GroupId" --output text)
             for SG in $SGs; do
+              # First remove any security group rules that reference other security groups
+              echo "Removing rules from security group: $SG"
+              
+              # Remove ingress rules
+              INGRESS_RULES=$(aws ec2 describe-security-group-rules --filters "Name=group-id,Values=$SG" "Name=is-egress,Values=false" --query "SecurityGroupRules[].SecurityGroupRuleId" --output text)
+              if [ -n "$INGRESS_RULES" ]; then
+                aws ec2 revoke-security-group-ingress --group-id $SG --security-group-rule-ids $INGRESS_RULES || true
+              fi
+              
+              # Remove egress rules
+              EGRESS_RULES=$(aws ec2 describe-security-group-rules --filters "Name=group-id,Values=$SG" "Name=is-egress,Values=true" --query "SecurityGroupRules[].SecurityGroupRuleId" --output text)
+              if [ -n "$EGRESS_RULES" ]; then
+                aws ec2 revoke-security-group-egress --group-id $SG --security-group-rule-ids $EGRESS_RULES || true
+              fi
+              
+              sleep 5
               aws ec2 delete-security-group --group-id $SG || true
             done
             
@@ -256,6 +287,11 @@ jobs:
               for ASSOC in $ASSOCS; do
                 aws ec2 disassociate-route-table --association-id $ASSOC || true
               done
+              # Delete non-default routes from main route table
+              ROUTES=$(aws ec2 describe-route-tables --route-table-id $RT --query "RouteTables[0].Routes[?GatewayId != 'local'].DestinationCidrBlock" --output text)
+              for ROUTE in $ROUTES; do
+                aws ec2 delete-route --route-table-id $RT --destination-cidr-block $ROUTE || true
+              done
               aws ec2 delete-route-table --route-table-id $RT || true
             done
             
@@ -264,11 +300,26 @@ jobs:
             IGW=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[0].InternetGatewayId" --output text)
             if [ -n "$IGW" ]; then
               aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC_ID || true
+              sleep 5
               aws ec2 delete-internet-gateway --internet-gateway-id $IGW || true
             fi
             
+            # Try to delete remaining network interfaces
+            echo "Final check for network interfaces..."
+            ENIs=$(aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=$VPC_ID" --query "NetworkInterfaces[].NetworkInterfaceId" --output text)
+            for ENI in $ENIs; do
+              echo "Trying to delete network interface: $ENI"
+              ATTACHMENT=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" --query "NetworkInterfaces[0].Attachment.AttachmentId" --output text)
+              if [ "$ATTACHMENT" != "None" ] && [ -n "$ATTACHMENT" ]; then
+                aws ec2 detach-network-interface --attachment-id "$ATTACHMENT" --force || true
+                sleep 10
+              fi
+              aws ec2 delete-network-interface --network-interface-id "$ENI" || true
+            done
+            
             # Finally delete the VPC
             echo "Deleting VPC..."
+            sleep 10  # Give AWS time to recognize all resources are deleted
             aws ec2 delete-vpc --vpc-id $VPC_ID || true
           else
             echo "VPC successfully deleted"
@@ -305,18 +356,38 @@ jobs:
           
           echo "Checking for bucket and table cleanup..."
           
-          # Final check for S3 bucket
+          # Final check for S3 bucket - handle versioned objects
           if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
             echo "Cleaning up S3 bucket $BUCKET_NAME..."
-            aws s3 rm s3://$BUCKET_NAME --recursive
-            aws s3api delete-bucket --bucket $BUCKET_NAME
-            echo "Bucket deleted"
+            
+            # Delete all versions and delete markers
+            echo "Removing all versions from bucket..."
+            aws s3api list-object-versions --bucket "$BUCKET_NAME" --output json | \
+            jq -r '.Versions[] | .Key + " " + .VersionId' | \
+            while read KEY VERSIONID; do
+              echo "Deleting object: $KEY ($VERSIONID)"
+              aws s3api delete-object --bucket "$BUCKET_NAME" --key "$KEY" --version-id "$VERSIONID"
+            done
+            
+            # Delete all delete markers
+            echo "Removing all delete markers from bucket..."
+            aws s3api list-object-versions --bucket "$BUCKET_NAME" --output json | \
+            jq -r '.DeleteMarkers[] | .Key + " " + .VersionId' | \
+            while read KEY VERSIONID; do
+              echo "Deleting delete marker: $KEY ($VERSIONID)"
+              aws s3api delete-object --bucket "$BUCKET_NAME" --key "$KEY" --version-id "$VERSIONID"
+            done
+            
+            # Now try to delete the bucket
+            echo "Deleting bucket..."
+            aws s3api delete-bucket --bucket "$BUCKET_NAME"
+            echo "Bucket deletion attempted"
           fi
           
           # Final check for DynamoDB table
           if aws dynamodb describe-table --table-name "$TABLE_NAME" 2>/dev/null; then
             echo "Cleaning up DynamoDB table $TABLE_NAME..."
-            aws dynamodb delete-table --table-name $TABLE_NAME
+            aws dynamodb delete-table --table-name "$TABLE_NAME"
             echo "Table deletion initiated"
           fi
           
