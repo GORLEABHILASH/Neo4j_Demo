@@ -5,10 +5,26 @@ on:
     paths:
       - 'bootstrap/**'
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      force_cleanup:
+        description: 'Force cleanup of existing resources (use with caution)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   bootstrap:
     runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
@@ -19,80 +35,152 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION || 'us-west-2' }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-duration-seconds: 1200
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.7
 
-      - name: Check Existing Resources
-        id: check_resources
+      - name: Extract Resource Names
+        id: resource_names
+        working-directory: bootstrap
         run: |
-          # Check if the resources already exist in AWS
-          BUCKET_EXISTS=$(aws s3api head-bucket --bucket $(grep -o 'bucket = "[^"]*"' bootstrap/main.tf | cut -d'"' -f2) 2>&1 || echo "not_exists")
-          TABLE_EXISTS=$(aws dynamodb describe-table --table-name $(grep -o 'name = "[^"]*"' bootstrap/main.tf | head -1 | cut -d'"' -f2) 2>&1 || echo "not_exists")
+          # Extract from Terraform configuration
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          PREFIX="neo4j-demos"
           
-          # Set outputs based on existence check
-          if [[ "$BUCKET_EXISTS" != *"not_exists"* ]]; then
-            echo "bucket_exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "bucket_exists=false" >> $GITHUB_OUTPUT
-          fi
+          echo "bucket_name=${PREFIX}-terraform-state-${ENV}" >> $GITHUB_OUTPUT
+          echo "table_name=${PREFIX}-terraform-locks-${ENV}" >> $GITHUB_OUTPUT
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
           
-          if [[ "$TABLE_EXISTS" != *"not_exists"* ]]; then
-            echo "table_exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "table_exists=false" >> $GITHUB_OUTPUT
-          fi
+          # Log for verification
+          echo "Using resource names:"
+          echo "  - S3 Bucket: ${PREFIX}-terraform-state-${ENV}"
+          echo "  - DynamoDB Table: ${PREFIX}-terraform-locks-${ENV}"
 
       - name: Terraform Init
         working-directory: bootstrap
         run: terraform init
 
-      - name: Terraform Import Resources (if they exist)
-        working-directory: bootstrap
-        if: steps.check_resources.outputs.bucket_exists == 'true' || steps.check_resources.outputs.table_exists == 'true'
+      # Only run cleanup if explicitly requested via workflow_dispatch
+      - name: Clean Up Existing Resources (If Requested)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_cleanup == 'true' }}
         run: |
-          # Get resource names from terraform files
-          BUCKET_NAME=$(grep -o 'bucket = "[^"]*"' main.tf | cut -d'"' -f2)
-          TABLE_NAME=$(grep -o 'name = "[^"]*"' main.tf | head -1 | cut -d'"' -f2)
+          BUCKET_NAME="${{ steps.resource_names.outputs.bucket_name }}"
+          TABLE_NAME="${{ steps.resource_names.outputs.table_name }}"
+          ENV="${{ steps.resource_names.outputs.environment }}"
           
-          # Import existing S3 bucket if it exists
-          if [[ "${{ steps.check_resources.outputs.bucket_exists }}" == "true" ]]; then
-            echo "Importing existing S3 bucket: $BUCKET_NAME"
-            terraform import aws_s3_bucket.terraform_state $BUCKET_NAME || true
+          # Only allow cleanup in dev/staging environments
+          if [[ "$ENV" == "prod" ]]; then
+            echo "::error::Force cleanup not allowed in production environment"
+            exit 1
           fi
           
-          # Import existing DynamoDB table if it exists
-          if [[ "${{ steps.check_resources.outputs.table_exists }}" == "true" ]]; then
+          echo "WARNING: Cleaning up existing resources as requested..."
+          
+          # Empty and delete S3 bucket if it exists
+          if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            echo "Emptying bucket $BUCKET_NAME..."
+            aws s3 rm s3://$BUCKET_NAME --recursive
+            echo "Deleting bucket $BUCKET_NAME..."
+            aws s3api delete-bucket --bucket $BUCKET_NAME
+          fi
+          
+          # Delete DynamoDB table if it exists
+          if aws dynamodb describe-table --table-name "$TABLE_NAME" 2>/dev/null; then
+            echo "Deleting DynamoDB table $TABLE_NAME..."
+            aws dynamodb delete-table --table-name $TABLE_NAME
+            aws dynamodb wait table-not-exists --table-name $TABLE_NAME
+          fi
+
+      - name: Import Existing Resources
+        id: import
+        working-directory: bootstrap
+        continue-on-error: true
+        run: |
+          BUCKET_NAME="${{ steps.resource_names.outputs.bucket_name }}"
+          TABLE_NAME="${{ steps.resource_names.outputs.table_name }}"
+          
+          # Check if resources exist
+          BUCKET_EXISTS=$(aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null && echo "true" || echo "false")
+          TABLE_EXISTS=$(aws dynamodb describe-table --table-name "$TABLE_NAME" 2>/dev/null && echo "true" || echo "false")
+          
+          if [[ "$BUCKET_EXISTS" == "true" ]]; then
+            echo "Importing existing S3 bucket: $BUCKET_NAME"
+            terraform import aws_s3_bucket.terraform_state "$BUCKET_NAME" || true
+            
+            # Import related resources
+            terraform import aws_s3_bucket_versioning.terraform_state_versioning "$BUCKET_NAME" || true
+            terraform import aws_s3_bucket_server_side_encryption_configuration.terraform_state_encryption "$BUCKET_NAME" || true
+            terraform import aws_s3_bucket_public_access_block.terraform_state_access "$BUCKET_NAME" || true
+          fi
+          
+          if [[ "$TABLE_EXISTS" == "true" ]]; then
             echo "Importing existing DynamoDB table: $TABLE_NAME"
-            terraform import aws_dynamodb_table.terraform_locks $TABLE_NAME || true
+            terraform import aws_dynamodb_table.terraform_locks "$TABLE_NAME" || true
+          fi
+          
+          # Set flag for apply step
+          if [[ "$BUCKET_EXISTS" == "true" || "$TABLE_EXISTS" == "true" ]]; then
+            echo "imported_resources=true" >> $GITHUB_OUTPUT
+          else
+            echo "imported_resources=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: bootstrap
+        run: |
+          terraform plan -out=tfplan
+          
+          # Check if plan has changes
+          CHANGES=$(terraform show -json tfplan | grep -c '"actions":\["create"\]' || true)
+          if [[ $CHANGES -gt 0 ]]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Terraform Apply
         working-directory: bootstrap
         run: |
-          terraform apply -auto-approve
+          if [[ "${{ steps.plan.outputs.has_changes }}" == "true" ]]; then
+            echo "Applying changes..."
+            terraform apply -auto-approve
+          else
+            echo "No changes to apply"
+          fi
           
-          # Extract backend values and store in GitHub environment
+          # Extract outputs regardless of whether changes were applied
           BUCKET_NAME=$(terraform output -raw state_bucket_name)
           TABLE_NAME=$(terraform output -raw dynamodb_table_name)
           
-          # Store single-line variables
           echo "TF_STATE_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
           echo "TF_LOCK_TABLE=$TABLE_NAME" >> $GITHUB_ENV
           
-          # Store terraform output as multi-line variable
+          # Store multi-line variable with all outputs
           echo "TERRAFORM_OUTPUTS<<EOF" >> $GITHUB_ENV
           terraform output -json >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
       - name: Store Outputs in SSM
         run: |
-          aws ssm put-parameter --name "/terraform/state_bucket" --value "$TF_STATE_BUCKET" --type "String" --overwrite
-          aws ssm put-parameter --name "/terraform/lock_table" --value "$TF_LOCK_TABLE" --type "String" --overwrite
+          # Store values with environment prefix
+          ENV="${{ steps.resource_names.outputs.environment }}"
           
-      - name: Log Terraform Outputs
+          aws ssm put-parameter --name "/terraform/${ENV}/state_bucket" --value "$TF_STATE_BUCKET" --type "String" --overwrite
+          aws ssm put-parameter --name "/terraform/${ENV}/lock_table" --value "$TF_LOCK_TABLE" --type "String" --overwrite
+          
+          echo "Successfully stored parameters in SSM:"
+          echo "  - /terraform/${ENV}/state_bucket: $TF_STATE_BUCKET"
+          echo "  - /terraform/${ENV}/lock_table: $TF_LOCK_TABLE"
+
+      - name: Notify Success
+        if: success()
         run: |
-          echo "Terraform State Bucket: ${{ env.TF_STATE_BUCKET }}"
-          echo "Terraform Lock Table: ${{ env.TF_LOCK_TABLE }}"
-          echo "Full Terraform Outputs:"
-          echo "${{ env.TERRAFORM_OUTPUTS }}"
+          echo "✅ Bootstrap workflow completed successfully"
+          echo "Resources are ready for use in your Terraform configurations"
+          echo "S3 Bucket: $TF_STATE_BUCKET"
+          echo "DynamoDB Table: $TF_LOCK_TABLE"
