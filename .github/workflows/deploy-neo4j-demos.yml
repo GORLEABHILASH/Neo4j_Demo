@@ -288,9 +288,13 @@ jobs:
         id: cluster-info
         run: |
           # Try to get the cluster name from SSM Parameter Store
-          CLUSTER_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/eks-cluster-name" --query "Parameter.Value" --output text 2>/dev/null || echo "neo4j-demo-cluster")
-          echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
+          if ! CLUSTER_NAME=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/eks-cluster-name" --query "Parameter.Value" --output text 2>/dev/null); then
+            echo "Could not find cluster name in SSM, using default"
+            CLUSTER_NAME="neo4j-demo-cluster"
+          fi
+          
           echo "Using EKS cluster: $CLUSTER_NAME"
+          echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
           
       - name: Update kubeconfig
         if: steps.check-demo.outputs.skip != 'true'

@@ -72,9 +72,13 @@ jobs:
         id: eks_cluster
         run: |
           ENV="${{ github.event.inputs.environment }}"
-          CLUSTER_NAME=$(aws ssm get-parameter --name "/neo4j-demos/$ENV/eks-cluster-name" --query "Parameter.Value" --output text 2>/dev/null || echo "neo4j-demo-cluster")
-          echo "cluster_name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+          if ! CLUSTER_NAME=$(aws ssm get-parameter --name "/neo4j-demos/$ENV/eks-cluster-name" --query "Parameter.Value" --output text 2>/dev/null); then
+            echo "Could not find cluster name in SSM, using default"
+            CLUSTER_NAME="neo4j-demo-cluster"
+          fi
+          
           echo "Using EKS cluster: $CLUSTER_NAME"
+          echo "cluster_name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
       
       - name: Clean up Kubernetes Namespaces
         run: |
