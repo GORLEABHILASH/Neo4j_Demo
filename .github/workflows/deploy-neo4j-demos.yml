@@ -341,8 +341,8 @@ jobs:
               dbms.security.auth_enabled=true
               dbms.directories.import=/var/lib/neo4j/import
               dbms.allow_upgrade=true
-              # Disable memory validation - environment has constraints Neo4j doesn't detect
-              dbms.memory.validation=false
+              # Disable strict validation to allow backward compatibility with config
+              server.config.strict_validation.enabled=false
           ---
           apiVersion: apps/v1
           kind: Deployment
