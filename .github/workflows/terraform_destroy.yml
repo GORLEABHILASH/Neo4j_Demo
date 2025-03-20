@@ -39,16 +39,33 @@ jobs:
           terraform_version: 1.5.7
           
       - name: Fetch Terraform Backend Details
+        id: backend_details
         run: |
           ENV="${{ github.event.inputs.environment }}"
           
-          TF_STATE_BUCKET=$(aws ssm get-parameter --name "/terraform/$ENV/state_bucket" --query "Parameter.Value" --output text)
-          TF_LOCK_TABLE=$(aws ssm get-parameter --name "/terraform/$ENV/lock_table" --query "Parameter.Value" --output text)
+          echo "Attempting to retrieve backend details from SSM..."
           
-          echo "Retrieved backend details for $ENV environment:"
+          # Try to get the bucket name from SSM, but use a default if not found
+          if ! TF_STATE_BUCKET=$(aws ssm get-parameter --name "/terraform/$ENV/state_bucket" --query "Parameter.Value" --output text 2>/dev/null); then
+            echo "SSM parameter for state bucket not found, using default naming convention"
+            TF_STATE_BUCKET="neo4j-demos-terraform-state-$ENV"
+          fi
+          
+          # Try to get the lock table name from SSM, but use a default if not found
+          if ! TF_LOCK_TABLE=$(aws ssm get-parameter --name "/terraform/$ENV/lock_table" --query "Parameter.Value" --output text 2>/dev/null); then
+            echo "SSM parameter for lock table not found, using default naming convention"
+            TF_LOCK_TABLE="neo4j-demos-terraform-locks-$ENV"
+          fi
+          
+          echo "Using backend details:"
           echo "  - Bucket: $TF_STATE_BUCKET"
           echo "  - Table: $TF_LOCK_TABLE"
           
+          # Set output variables for use in other steps
+          echo "bucket_name=$TF_STATE_BUCKET" >> $GITHUB_OUTPUT
+          echo "table_name=$TF_LOCK_TABLE" >> $GITHUB_OUTPUT
+          
+          # Also set environment variables for this job
           echo "TF_STATE_BUCKET=$TF_STATE_BUCKET" >> $GITHUB_ENV
           echo "TF_LOCK_TABLE=$TF_LOCK_TABLE" >> $GITHUB_ENV
           
