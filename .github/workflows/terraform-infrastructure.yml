@@ -157,32 +157,56 @@ jobs:
         working-directory: Terraform
         continue-on-error: true
         run: |
-          # Check if ECR repositories exist and import them
+          # Check if ECR repositories exist and import them only if not already in state
           echo "Checking for existing ECR repositories..."
           
-          # Check and import neo4j-basic-demo
+          # For neo4j-basic-demo
           if aws ecr describe-repositories --repository-names neo4j-basic-demo 2>/dev/null; then
-            echo "Importing neo4j-basic-demo repository..."
-            terraform import 'aws_ecr_repository.demo_repos["neo4j-basic-demo"]' neo4j-basic-demo || true
+            echo "Found neo4j-basic-demo repository"
+            # Check if already in state
+            if ! terraform state show 'aws_ecr_repository.demo_repos["neo4j-basic-demo"]' &>/dev/null; then
+              echo "Importing neo4j-basic-demo repository..."
+              terraform import 'aws_ecr_repository.demo_repos["neo4j-basic-demo"]' neo4j-basic-demo || true
+            else
+              echo "neo4j-basic-demo already in Terraform state, skipping import"
+            fi
           fi
           
-          # Check and import neo4j-social-network
+          # For neo4j-social-network
           if aws ecr describe-repositories --repository-names neo4j-social-network 2>/dev/null; then
-            echo "Importing neo4j-social-network repository..."
-            terraform import 'aws_ecr_repository.demo_repos["neo4j-social-network"]' neo4j-social-network || true
+            echo "Found neo4j-social-network repository"
+            # Check if already in state
+            if ! terraform state show 'aws_ecr_repository.demo_repos["neo4j-social-network"]' &>/dev/null; then
+              echo "Importing neo4j-social-network repository..."
+              terraform import 'aws_ecr_repository.demo_repos["neo4j-social-network"]' neo4j-social-network || true
+            else
+              echo "neo4j-social-network already in Terraform state, skipping import"
+            fi
           fi
           
-          # Check and import neo4j-movie-recommendation
+          # For neo4j-movie-recommendation
           if aws ecr describe-repositories --repository-names neo4j-movie-recommendation 2>/dev/null; then
-            echo "Importing neo4j-movie-recommendation repository..."
-            terraform import 'aws_ecr_repository.demo_repos["neo4j-movie-recommendation"]' neo4j-movie-recommendation || true
+            echo "Found neo4j-movie-recommendation repository"
+            # Check if already in state
+            if ! terraform state show 'aws_ecr_repository.demo_repos["neo4j-movie-recommendation"]' &>/dev/null; then
+              echo "Importing neo4j-movie-recommendation repository..."
+              terraform import 'aws_ecr_repository.demo_repos["neo4j-movie-recommendation"]' neo4j-movie-recommendation || true
+            else
+              echo "neo4j-movie-recommendation already in Terraform state, skipping import"
+            fi
           fi
           
           # Check if KMS alias exists and import it
           echo "Checking for existing KMS alias..."
           if aws kms list-aliases --query "Aliases[?AliasName=='alias/eks/neo4j-demo-cluster']" | grep -q "alias/eks/neo4j-demo-cluster"; then
-            echo "Importing KMS alias..."
-            terraform import 'module.eks.module.kms.aws_kms_alias.this["cluster"]' alias/eks/neo4j-demo-cluster || true
+            echo "Found KMS alias"
+            # Check if already in state
+            if ! terraform state show 'module.eks.module.kms.aws_kms_alias.this["cluster"]' &>/dev/null; then
+              echo "Importing KMS alias..."
+              terraform import 'module.eks.module.kms.aws_kms_alias.this["cluster"]' alias/eks/neo4j-demo-cluster || true
+            else
+              echo "KMS alias already in Terraform state, skipping import"
+            fi
           fi
             
       - name: Terraform Plan
@@ -197,45 +221,24 @@ jobs:
         run: |
           ENV="${{ github.event.inputs.environment || 'dev' }}"
           
-          # Store EKS cluster name - use a more robust approach
-          cd Terraform
-          if terraform output -json > tf_output.json 2>/dev/null; then
-            # Try to extract cluster name from JSON output
-            CLUSTER_NAME=$(cat tf_output.json | jq -r '.eks_cluster_name.value // empty' 2>/dev/null)
-            if [ -z "$CLUSTER_NAME" ]; then
-              echo "Could not find eks_cluster_name in Terraform outputs, using default"
-              CLUSTER_NAME="neo4j-demo-cluster"
-            fi
-          else
-            echo "Failed to get Terraform outputs, using default cluster name"
-            CLUSTER_NAME="neo4j-demo-cluster"
-          fi
-          cd ..
+          # Store EKS cluster name directly (don't try to use Terraform outputs)
+          CLUSTER_NAME="neo4j-demo-cluster"
           
           echo "Using EKS cluster name: $CLUSTER_NAME"
           aws ssm put-parameter --name "/neo4j-demos/$ENV/eks-cluster-name" --value "$CLUSTER_NAME" --type "String" --overwrite
           
-          # Store domain name if it exists in output - using more robust approach
-          cd Terraform
-          if [ -f "tf_output.json" ]; then
-            DOMAIN_NAME=$(cat tf_output.json | jq -r '.domain_name.value // empty' 2>/dev/null)
-            if [ -z "$DOMAIN_NAME" ]; then
-              DOMAIN_NAME="neo4j-demos.example.com"
-            fi
-          else
-            DOMAIN_NAME="neo4j-demos.example.com"
-          fi
-          cd ..
+          # Use a fixed domain name for now
+          DOMAIN_NAME="neo4j-demos.example.com"
           
           echo "Using domain name: $DOMAIN_NAME"
           aws ssm put-parameter --name "/neo4j-demos/$ENV/domain-name" --value "$DOMAIN_NAME" --type "String" --overwrite
           
-          # Set default values for other parameters if they don't exist
+          # Set default values for other parameters
           echo "Setting default Neo4j version and replica count"
-          aws ssm put-parameter --name "/neo4j-demos/$ENV/neo4j-version" --value "5.11" --type "String" --overwrite || true
-          aws ssm put-parameter --name "/neo4j-demos/$ENV/app-replicas" --value "1" --type "String" --overwrite || true
+          aws ssm put-parameter --name "/neo4j-demos/$ENV/neo4j-version" --value "5.11" --type "String" --overwrite
+          aws ssm put-parameter --name "/neo4j-demos/$ENV/app-replicas" --value "1" --type "String" --overwrite
           
-          # Set a demo password if it doesn't exist (should be done securely in production)
+          # Set a demo password if it doesn't exist
           if ! aws ssm get-parameter --name "/neo4j-demos/$ENV/neo4j-password" >/dev/null 2>&1; then
             echo "Setting default Neo4j password"
             aws ssm put-parameter --name "/neo4j-demos/$ENV/neo4j-password" --value "Neo4jDemo2024!" --type "SecureString" --overwrite
