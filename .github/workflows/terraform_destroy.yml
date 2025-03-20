@@ -62,9 +62,226 @@ jobs:
             -backend-config="dynamodb_table=$TF_LOCK_TABLE" \
             -backend-config="region=${{ secrets.AWS_REGION || 'us-west-2' }}"
       
+      - name: Clean Up ECR Repositories
+        run: |
+          echo "Cleaning up ECR repositories before Terraform destroy..."
+          
+          # List of repositories to clean
+          REPOS=("neo4j-basic-demo" "neo4j-social-network" "neo4j-movie-recommendation")
+          
+          for REPO in "${REPOS[@]}"; do
+            echo "Checking repository: $REPO"
+            
+            # Check if repository exists
+            if aws ecr describe-repositories --repository-names "$REPO" 2>/dev/null; then
+              echo "Repository $REPO exists, deleting all images..."
+              
+              # Get image IDs and delete them
+              IMAGE_IDS=$(aws ecr list-images --repository-name "$REPO" --query 'imageIds[*]' --output json)
+              
+              if [ "$IMAGE_IDS" != "[]" ] && [ -n "$IMAGE_IDS" ]; then
+                echo "Deleting images from $REPO..."
+                aws ecr batch-delete-image --repository-name "$REPO" --image-ids "$IMAGE_IDS" || true
+                echo "Waiting for image deletion to complete..."
+                sleep 10
+              else
+                echo "No images found in $REPO"
+              fi
+            else
+              echo "Repository $REPO not found"
+            fi
+          done
+      
+      - name: Clean Up EKS Resources
+        run: |
+          echo "Cleaning up EKS resources before Terraform destroy..."
+          
+          # Check if EKS cluster exists
+          if aws eks describe-cluster --name "neo4j-demo-cluster" 2>/dev/null; then
+            echo "EKS cluster exists, cleaning up dependent resources..."
+            
+            # Get all node groups and delete them first
+            NODE_GROUPS=$(aws eks list-nodegroups --cluster-name "neo4j-demo-cluster" --query "nodegroups[]" --output text)
+            
+            for NG in $NODE_GROUPS; do
+              echo "Deleting node group: $NG"
+              aws eks delete-nodegroup --cluster-name "neo4j-demo-cluster" --nodegroup-name "$NG"
+              echo "Waiting for node group deletion..."
+              aws eks wait nodegroup-deleted --cluster-name "neo4j-demo-cluster" --nodegroup-name "$NG"
+            done
+            
+            # Check for any load balancers created by EKS service
+            echo "Checking for EKS service load balancers..."
+            SERVICES=$(aws eks list-services --cluster-name "neo4j-demo-cluster" --query "services[]" --output text 2>/dev/null || echo "")
+            
+            if [ -n "$SERVICES" ]; then
+              for SVC in $SERVICES; do
+                echo "Deleting service: $SVC"
+                aws eks delete-service --cluster-name "neo4j-demo-cluster" --service-name "$SVC"
+              done
+            fi
+          else
+            echo "EKS cluster not found"
+          fi
+          
+      - name: Clean Up Network Resources
+        run: |
+          echo "Cleaning up network resources before Terraform destroy..."
+          
+          # Get VPC ID
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*neo4j-demos*" --query "Vpcs[0].VpcId" --output text)
+          
+          if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
+            echo "Found VPC: $VPC_ID"
+            
+            # Release Elastic IPs
+            echo "Checking for Elastic IPs..."
+            EIP_ALLOCS=$(aws ec2 describe-addresses --filters "Name=domain,Values=vpc" --query "Addresses[?AssociationId].AllocationId" --output text)
+            
+            for EIP in $EIP_ALLOCS; do
+              echo "Releasing Elastic IP: $EIP"
+              aws ec2 release-address --allocation-id "$EIP"
+            done
+            
+            # Find and delete NAT gateways
+            echo "Checking for NAT Gateways..."
+            NAT_GWS=$(aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$VPC_ID" --query "NatGateways[?State!='deleted'].NatGatewayId" --output text)
+            
+            for NAT in $NAT_GWS; do
+              echo "Deleting NAT Gateway: $NAT"
+              aws ec2 delete-nat-gateway --nat-gateway-id "$NAT"
+            done
+            
+            if [ -n "$NAT_GWS" ]; then
+              echo "Waiting for NAT gateways to be deleted..."
+              sleep 90
+            fi
+            
+            # Find network interfaces
+            echo "Checking for network interfaces..."
+            ENIs=$(aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=$VPC_ID" --query "NetworkInterfaces[].NetworkInterfaceId" --output text)
+            
+            for ENI in $ENIs; do
+              echo "Deleting network interface: $ENI"
+              # First try to detach if attached
+              ATTACHMENT=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" --query "NetworkInterfaces[0].Attachment.AttachmentId" --output text)
+              if [ "$ATTACHMENT" != "None" ] && [ -n "$ATTACHMENT" ]; then
+                echo "Detaching $ENI first..."
+                aws ec2 detach-network-interface --attachment-id "$ATTACHMENT" --force || true
+                sleep 5
+              fi
+              aws ec2 delete-network-interface --network-interface-id "$ENI" || true
+            done
+          else
+            echo "VPC not found"
+          fi
+          
+      - name: Verify and Clean ALB Resources
+        run: |
+          echo "Checking for lingering ALB resources..."
+          
+          # List all load balancers and find ones that match your naming pattern
+          LBS=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName, 'neo4j-demos') || contains(DNSName, 'neo4j-demos')].LoadBalancerArn" --output text)
+          
+          if [ -n "$LBS" ]; then
+            echo "Found lingering load balancers, attempting cleanup..."
+            
+            for LB in $LBS; do
+              echo "Deleting load balancer: $LB"
+              # Delete listeners first to avoid dependency issues
+              LISTENERS=$(aws elbv2 describe-listeners --load-balancer-arn $LB --query "Listeners[].ListenerArn" --output text)
+              for LISTENER in $LISTENERS; do
+                aws elbv2 delete-listener --listener-arn $LISTENER
+              done
+              
+              # Delete the load balancer
+              aws elbv2 delete-load-balancer --load-balancer-arn $LB
+            done
+            
+            echo "Waiting for load balancers to be deleted..."
+            sleep 60
+          else
+            echo "No lingering load balancers found."
+          fi
+          
+          # Check for orphaned target groups
+          TGS=$(aws elbv2 describe-target-groups --query "TargetGroups[?contains(TargetGroupName, 'neo4j-demos')].TargetGroupArn" --output text)
+          
+          if [ -n "$TGS" ]; then
+            echo "Found lingering target groups, attempting cleanup..."
+            
+            for TG in $TGS; do
+              echo "Deleting target group: $TG"
+              aws elbv2 delete-target-group --target-group-arn $TG
+            done
+          else
+            echo "No lingering target groups found."
+          fi
+
       - name: Terraform Destroy (Main Infrastructure)
         working-directory: Terraform
         run: terraform destroy -auto-approve
+        continue-on-error: true
+        
+      - name: Force Destroy Remaining Resources
+        run: |
+          echo "Checking for any remaining resources after Terraform destroy..."
+          
+          # Get VPC ID again
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*neo4j-demos*" --query "Vpcs[0].VpcId" --output text)
+          
+          if [ "$VPC_ID" != "None" ] && [ -n "$VPC_ID" ]; then
+            echo "VPC still exists: $VPC_ID. Performing manual cleanup..."
+            
+            # Delete all security groups except default
+            echo "Removing security groups..."
+            SGs=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[?GroupName!='default'].GroupId" --output text)
+            for SG in $SGs; do
+              aws ec2 delete-security-group --group-id $SG || true
+            done
+            
+            # Delete all subnets
+            echo "Removing subnets..."
+            SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[].SubnetId" --output text)
+            for SUBNET in $SUBNETS; do
+              aws ec2 delete-subnet --subnet-id $SUBNET || true
+            done
+            
+            # Delete all route tables except the main one
+            echo "Removing route tables..."
+            RTs=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --query "RouteTables[?Associations[0].Main!=\`true\`].RouteTableId" --output text)
+            for RT in $RTs; do
+              # First remove associations
+              ASSOCS=$(aws ec2 describe-route-tables --route-table-id $RT --query "RouteTables[0].Associations[?Main!=\`true\`].RouteTableAssociationId" --output text)
+              for ASSOC in $ASSOCS; do
+                aws ec2 disassociate-route-table --association-id $ASSOC || true
+              done
+              aws ec2 delete-route-table --route-table-id $RT || true
+            done
+            
+            # Detach and delete internet gateway
+            echo "Removing internet gateway..."
+            IGW=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[0].InternetGatewayId" --output text)
+            if [ -n "$IGW" ]; then
+              aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC_ID || true
+              aws ec2 delete-internet-gateway --internet-gateway-id $IGW || true
+            fi
+            
+            # Finally delete the VPC
+            echo "Deleting VPC..."
+            aws ec2 delete-vpc --vpc-id $VPC_ID || true
+          else
+            echo "VPC successfully deleted"
+          fi
+          
+          # Clean up ECR repositories if they still exist
+          echo "Final check for ECR repositories..."
+          for REPO in "neo4j-basic-demo" "neo4j-social-network" "neo4j-movie-recommendation"; do
+            if aws ecr describe-repositories --repository-names "$REPO" 2>/dev/null; then
+              echo "Forcing deletion of repository: $REPO"
+              aws ecr delete-repository --repository-name "$REPO" --force || true
+            fi
+          done
         
       # Then destroy the bootstrap resources
       - name: Terraform Init (Bootstrap)
