@@ -17,3 +17,6 @@ logs/
 .DS_Store
 .idea/
 .vscode/
+
+terraform.tfstate
+terraform.tfstate.backup

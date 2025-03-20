@@ -34,6 +34,11 @@ on:
         required: false
         default: false
         type: boolean
+      build_only:
+        description: 'Only build and push images, skip deployment'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   determine-demos:
@@ -46,7 +51,7 @@ jobs:
         with:
           fetch-depth: 0
       
-      - name: Determine demos to deploy
+      - name: Determine demos to process
         id: set-matrix
         run: |
           if [[ "${{ github.event.inputs.deploy_all }}" == "true" ]]; then
@@ -68,7 +73,7 @@ jobs:
           fi
           
           # Output the demos for logs
-          echo "Selected demos to deploy: $(jq -n "$GITHUB_OUTPUT" | jq -c '.demo')"
+          echo "Selected demos to process: $(echo "$CHANGED_DEMOS" | jq -c '.')"
 
   build-and-push:
     needs: determine-demos
@@ -77,72 +82,93 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.determine-demos.outputs.matrix) }}
       fail-fast: false
-    env:
-      AWS_REGION: us-west-2
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Set up Node.js
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-west-2' }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Set environment & build ID
+        run: |
+          DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
+          echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
+          echo "BUILD_ID=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ secrets.AWS_REGION || 'us-west-2' }}" >> $GITHUB_ENV
+      
+      - name: Set up Node.js for build
         uses: actions/setup-node@v3
         with:
           node-version: '18'
           cache: 'npm'
           cache-dependency-path: 'demos/${{ matrix.demo }}/package-lock.json'
 
-      - name: Install dependencies
+      - name: Install dependencies and build
         working-directory: demos/${{ matrix.demo }}
-        run: npm ci
-      
-      - name: Build application
-        working-directory: demos/${{ matrix.demo }}
-        run: npm run build
-      
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-      
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-      
-      - name: Set environment & tag
         run: |
-          DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
-          echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
-          echo "IMAGE_TAG=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
-          echo "ECR_REPOSITORY_PREFIX=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_ENV
+          if [ -f "package.json" ]; then
+            npm ci
+            npm run build
+          fi
+      
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ matrix.demo }}
+        run: |
+          cd demos/${{ matrix.demo }}
           
-      - name: Build, tag, and push image
-        working-directory: demos/${{ matrix.demo }}
-        run: |
-          # Make sure ECR repository exists
+          # Make sure repository exists
           aws ecr describe-repositories --repository-names ${{ matrix.demo }} || aws ecr create-repository --repository-name ${{ matrix.demo }}
           
-          docker build -t ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.IMAGE_TAG }} .
-          docker push ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.IMAGE_TAG }}
+          # Build with unique build ID
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }} .
           
-          # Tag as latest for the specific environment
-          docker tag ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.IMAGE_TAG }} ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.DEPLOY_ENV }}-latest
-          docker push ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.DEPLOY_ENV }}-latest
+          # Tag with latest
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }} $ECR_REGISTRY/$ECR_REPOSITORY:latest
           
-          # Also tag as just 'latest' for simplicity
-          docker tag ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:${{ env.IMAGE_TAG }} ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:latest
-          docker push ${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.demo }}:latest
+          # Tag with environment-specific latest 
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }} $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.DEPLOY_ENV }}-latest
+          
+          # Push all tags
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.BUILD_ID }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.DEPLOY_ENV }}-latest
+          
+          # Update the SSM parameters with the image version information
+          aws ssm put-parameter \
+            --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/${{ matrix.demo }}-image-tag" \
+            --value "${{ env.BUILD_ID }}" \
+            --type String \
+            --overwrite
+          
+          aws ssm put-parameter \
+            --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/${{ matrix.demo }}-last-updated" \
+            --value "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            --type String \
+            --overwrite
+          
+          echo "Image $ECR_REGISTRY/$ECR_REPOSITORY has been tagged with:"
+          echo "- ${{ env.BUILD_ID }} (specific build)"
+          echo "- latest (latest overall)"
+          echo "- ${{ env.DEPLOY_ENV }}-latest (latest for ${{ env.DEPLOY_ENV }} environment)"
   
   deploy:
     needs: [determine-demos, build-and-push]
-    if: ${{ fromJson(needs.determine-demos.outputs.matrix).demo[0] != null }}
+    if: ${{ fromJson(needs.determine-demos.outputs.matrix).demo[0] != null && github.event.inputs.build_only != 'true' }}
     runs-on: ubuntu-latest
     strategy:
       matrix: ${{ fromJson(needs.determine-demos.outputs.matrix) }}
       fail-fast: false
     env:
-      AWS_REGION: us-west-2
       CLUSTER_NAME: neo4j-demo-cluster
     
     steps:
@@ -154,14 +180,18 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-west-2' }}
       
       - name: Set environment variables
         run: |
           DEPLOY_ENV="${{ github.event.inputs.environment || 'dev' }}"
           echo "DEPLOY_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
-          echo "IMAGE_TAG=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
-          echo "ECR_REPOSITORY_PREFIX=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_ENV
+          echo "BUILD_ID=${GITHUB_SHA::8}-$(date +%s)" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ secrets.AWS_REGION || 'us-west-2' }}" >> $GITHUB_ENV
+          echo "ECR_REGISTRY=${{ steps.login-ecr.outputs.registry || format('{0}.dkr.ecr.{1}.amazonaws.com', secrets.AWS_ACCOUNT_ID, env.AWS_REGION) }}" >> $GITHUB_ENV
+          
+      - name: Login to Amazon ECR for deployment
+        uses: aws-actions/amazon-ecr-login@v1
           
       - name: Update kubeconfig
         run: |
@@ -170,7 +200,7 @@ jobs:
       - name: Force complete cleanup if requested
         if: ${{ github.event.inputs.force_cleanup == 'true' }}
         run: |
-          echo "Performing complete namespace cleanup..."
+          echo "Performing complete namespace cleanup for ${{ matrix.demo }}..."
           kubectl delete namespace ${{ matrix.demo }} --wait=true || true
           sleep 10 # Give K8s some time to clean up resources
       
@@ -304,7 +334,7 @@ jobs:
       
       - name: Create Demo App template
         run: |
-          # Creating the Demo App template file with latest tag and imagePullPolicy Always
+          # Creating the Demo App template file
           cat > deployment/demo-app-template.yaml << 'EOFAPP'
           apiVersion: apps/v1
           kind: Deployment
@@ -326,7 +356,7 @@ jobs:
               spec:
                 containers:
                 - name: {{DEMO_NAME}}-app
-                  image: {{ECR_REPO_URL}}/{{DEMO_NAME}}:latest
+                  image: {{ECR_REGISTRY}}/{{DEMO_NAME}}:{{IMAGE_TAG}}
                   imagePullPolicy: Always
                   ports:
                   - containerPort: 8080
@@ -389,9 +419,12 @@ jobs:
               alb.ingress.kubernetes.io/scheme: internet-facing
               alb.ingress.kubernetes.io/target-type: ip
               alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+              alb.ingress.kubernetes.io/load-balancer-name: "neo4j-demos-{{ENVIRONMENT}}"
+              alb.ingress.kubernetes.io/group.name: "neo4j-demos-{{ENVIRONMENT}}"
           spec:
             rules:
-            - http:
+            - host: {{DEMO_NAME}}.{{DOMAIN_NAME}}
+              http:
                 paths:
                 - path: /
                   pathType: Prefix
@@ -409,6 +442,7 @@ jobs:
           NEO4J_VERSION=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-version" --query "Parameter.Value" --output text || echo "4.4")
           NEO4J_PASSWORD=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/neo4j-password" --with-decryption --query "Parameter.Value" --output text || echo "password")
           REPLICAS=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/app-replicas" --query "Parameter.Value" --output text || echo "1")
+          IMAGE_TAG=$(aws ssm get-parameter --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/${{ matrix.demo }}-image-tag" --query "Parameter.Value" --output text || echo "${{ env.DEPLOY_ENV }}-latest")
           
           # Prepare Neo4j auth and password base64
           NEO4J_AUTH_BASE64=$(echo -n "neo4j/${NEO4J_PASSWORD}" | base64 -w 0)
@@ -431,8 +465,9 @@ jobs:
           cat deployment/demo-app-template.yaml | \
           sed "s/{{DEMO_NAME}}/${{ matrix.demo }}/g" | \
           sed "s/{{REPLICAS}}/${REPLICAS}/g" | \
-          sed "s|{{ECR_REPO_URL}}|${{ env.ECR_REPOSITORY_PREFIX }}|g" | \
-          sed "s/{{BUILD_ID}}/${{ env.IMAGE_TAG }}/g" | \
+          sed "s|{{ECR_REGISTRY}}|${{ steps.login-ecr.outputs.registry || format('{0}.dkr.ecr.{1}.amazonaws.com', secrets.AWS_ACCOUNT_ID, env.AWS_REGION) }}|g" | \
+          sed "s/{{IMAGE_TAG}}/${IMAGE_TAG}/g" | \
+          sed "s/{{BUILD_ID}}/${{ env.BUILD_ID }}/g" | \
           sed "s/{{DEPLOY_TIME}}/${DEPLOY_TIME}/g" | \
           sed "s/{{ENVIRONMENT}}/${{ env.DEPLOY_ENV }}/g" | \
           sed "s/{{DOMAIN_NAME}}/${DOMAIN_NAME}/g" > generated-manifests/app-${{ matrix.demo }}.yaml
@@ -489,7 +524,7 @@ jobs:
             --table-name neo4j-demo-deployments \
             --item '{
               "demo_id": {"S": "${{ matrix.demo }}"},
-              "version": {"S": "${{ env.IMAGE_TAG }}"},
+              "version": {"S": "${{ env.BUILD_ID }}"},
               "environment": {"S": "${{ env.DEPLOY_ENV }}"},
               "deployment_time": {"S": "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"},
               "deployed_by": {"S": "${{ github.actor }}"},
