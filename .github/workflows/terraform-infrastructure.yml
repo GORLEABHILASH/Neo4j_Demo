@@ -61,41 +61,86 @@ jobs:
       - name: Bootstrap Terraform State
         working-directory: bootstrap
         run: |
-          # Run bootstrap terraform
+          # Initialize and apply Terraform
           terraform init
-          terraform apply -auto-approve -var="environment=${{ env.DEPLOY_ENV }}" -var="project_name=${{ env.PROJECT_NAME }}" -var="aws_region=${{ secrets.AWS_REGION || 'us-west-2' }}"
+          terraform apply -auto-approve \
+            -var="environment=${{ env.DEPLOY_ENV }}" \
+            -var="project_name=${{ env.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION || 'us-west-2' }}"
           
-          # Capture clean outputs by redirecting stderr and using grep to extract only the actual value
-          BUCKET_NAME=$(terraform output -raw state_bucket_name 2>/dev/null | head -n1 | tr -d '\n\r')
-          TABLE_NAME=$(terraform output -raw dynamodb_table_name 2>/dev/null | head -n1 | tr -d '\n\r')
-          
-          # Debug: Show extracted values
-          echo "Captured bucket name: $BUCKET_NAME"
-          echo "Captured table name: $TABLE_NAME"
-          
-          # Validate the outputs
-          if [[ -z "$BUCKET_NAME" || "$BUCKET_NAME" == *"::debug::"* ]]; then
-            echo "Error: Failed to capture clean bucket name" >&2
+          # Capture Terraform outputs without additional debug output
+          BUCKET_NAME=$(terraform output -raw state_bucket_name 2>/dev/null | tr -d '\n\r ')
+          TABLE_NAME=$(terraform output -raw dynamodb_table_name 2>/dev/null | tr -d '\n\r ')
+
+          # Debugging: Show extracted values
+          echo "Captured bucket name: '$BUCKET_NAME'"
+          echo "Captured table name: '$TABLE_NAME'"
+
+          # Validate Bucket Name (Ensure it follows AWS naming rules)
+          if [[ ! "$BUCKET_NAME" =~ ^[a-z0-9.-]{3,63}$ ]]; then
+            echo "Error: Invalid bucket name detected: '$BUCKET_NAME'" >&2
             exit 1
           fi
-          
-          if [[ -z "$TABLE_NAME" || "$TABLE_NAME" == *"::debug::"* ]]; then
-            echo "Error: Failed to capture clean table name" >&2
+
+          # Ensure outputs are not empty
+          if [[ -z "$BUCKET_NAME" ]]; then
+            echo "Error: S3 bucket name is empty!" >&2
             exit 1
           fi
-    
+
+          if [[ -z "$TABLE_NAME" ]]; then
+            echo "Error: DynamoDB table name is empty!" >&2
+            exit 1
+          fi
+
           # Set environment variables
           echo "TF_STATE_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
           echo "TF_LOCK_TABLE=$TABLE_NAME" >> $GITHUB_ENV
 
+          - name: Terraform Init
+          working-directory: Terraform
+          run: |
+            # Debugging: Show what values will be used
+            echo "Using bucket name: '$TF_STATE_BUCKET'"
+            echo "Using lock table: '$TF_LOCK_TABLE'"
+        
+            # Validate that environment variables are correctly set
+            if [[ -z "$TF_STATE_BUCKET" ]]; then
+              echo "Error: TF_STATE_BUCKET is empty!" >&2
+              exit 1
+            fi
+        
+            if [[ -z "$TF_LOCK_TABLE" ]]; then
+              echo "Error: TF_LOCK_TABLE is empty!" >&2
+              exit 1
+            fi
+        
       - name: Terraform Init
         working-directory: Terraform
         run: |
+          # Debugging: Show what values will be used
+          echo "Using bucket name: '$TF_STATE_BUCKET'"
+          echo "Using lock table: '$TF_LOCK_TABLE'"
+      
+          # Validate that environment variables are correctly set
+          if [[ -z "$TF_STATE_BUCKET" ]]; then
+            echo "Error: TF_STATE_BUCKET is empty!" >&2
+            exit 1
+          fi
+      
+          if [[ -z "$TF_LOCK_TABLE" ]]; then
+            echo "Error: TF_LOCK_TABLE is empty!" >&2
+            exit 1
+          fi
+      
+          # Initialize Terraform with validated values
           terraform init \
             -backend-config="bucket=$TF_STATE_BUCKET" \
             -backend-config="key=${{ env.DEPLOY_ENV }}/terraform.tfstate" \
             -backend-config="region=${{ secrets.AWS_REGION || 'us-west-2' }}" \
             -backend-config="dynamodb_table=$TF_LOCK_TABLE"
+    
+        
 
       - name: Terraform Format
         working-directory: Terraform
