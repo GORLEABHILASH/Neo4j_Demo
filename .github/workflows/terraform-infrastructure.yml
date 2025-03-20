@@ -23,20 +23,6 @@ on:
           - dev
           - staging
           - prod
-      terraform_action:
-        description: 'Terraform action to perform'
-        required: true
-        default: 'apply'
-        type: choice
-        options:
-          - plan
-          - apply
-          - destroy
-      import_state:
-        description: 'Import existing resources into state'
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   terraform:
@@ -69,41 +55,7 @@ jobs:
           echo "TF_VAR_environment=$DEPLOY_ENV" >> $GITHUB_ENV
 
       - name: Terraform Init
-        run: |
-          # Initialize with remote backend if configured
-          terraform init
-          
-          # Check if state file exists (non-zero exit code if missing)
-          terraform state list &>/dev/null
-          STATE_EXISTS=$?
-          echo "STATE_EXISTS=$STATE_EXISTS" >> $GITHUB_ENV
-
-      - name: Import Existing Resources
-        if: ${{ github.event.inputs.import_state == 'true' || env.STATE_EXISTS != 0 }}
-        run: |
-          echo "Attempting to import existing resources into Terraform state..."
-          
-          # First attempt a refresh to see what might already exist
-          terraform refresh || true
-          
-          # You may need to manually import resources that already exist
-          # Example imports (modify as needed for your infrastructure):
-          terraform import aws_iam_role.eks_node_role eks-node-role || true
-          terraform import aws_iam_role.eks_admin eks-admin-role || true
-          terraform import aws_iam_policy.eks_ecr_access arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:policy/eks-ecr-access-policy || true
-          terraform import aws_iam_policy.alb_controller_policy arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:policy/ALBIngressControllerIAMPolicy || true
-          terraform import aws_iam_policy.external_dns_policy arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:policy/ExternalDNSIAMPolicy || true
-          
-          # Import ECR repositories
-          terraform import 'aws_ecr_repository.demo_repos["neo4j-movie-recommendation"]' neo4j-movie-recommendation || true
-          terraform import 'aws_ecr_repository.demo_repos["neo4j-basic-demo"]' neo4j-basic-demo || true
-          terraform import 'aws_ecr_repository.demo_repos["neo4j-social-network"]' neo4j-social-network || true
-          
-          # Import S3 and DynamoDB resources
-          terraform import aws_s3_bucket.demo_config neo4j-demo-config-${{ env.DEPLOY_ENV }} || true
-          terraform import aws_dynamodb_table.demo_deployments neo4j-demo-deployments || true
-          
-          echo "Import operations completed. Some may have failed if the resources don't exist or aren't accessible."
+        run: terraform init
 
       - name: Terraform Format
         run: terraform fmt -check || true
@@ -112,47 +64,16 @@ jobs:
         run: terraform validate
 
       - name: Terraform Plan
-        id: plan
-        run: |
-          # Create plan with detailed exit code
-          terraform plan -detailed-exitcode -out=tfplan
-          PLAN_EXIT_CODE=$?
-          echo "PLAN_EXIT_CODE=$PLAN_EXIT_CODE" >> $GITHUB_ENV
-          
-          # 0 = No changes, 1 = Error, 2 = Changes present
-          if [ $PLAN_EXIT_CODE -eq 1 ]; then
-            echo "Terraform plan failed!"
-            exit 1
-          fi
-          
-          # Show the plan for visibility
-          terraform show -no-color tfplan
+        run: terraform plan -out=tfplan
 
       - name: Terraform Apply
-        if: |
-          (github.ref == 'refs/heads/main' && 
-          github.event_name != 'pull_request' && 
-          (github.event.inputs.terraform_action == 'apply' || github.event.inputs.terraform_action == '')) && 
-          (env.PLAN_EXIT_CODE == '2' || env.PLAN_EXIT_CODE == '0')
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         run: terraform apply -auto-approve tfplan
 
-      - name: Terraform Destroy
-        if: |
-          github.ref == 'refs/heads/main' && 
-          github.event_name != 'pull_request' && 
-          github.event.inputs.terraform_action == 'destroy'
-        run: terraform destroy -auto-approve
-
       - name: Save Terraform Outputs to SSM
-        if: |
-          github.ref == 'refs/heads/main' && 
-          github.event_name != 'pull_request' && 
-          github.event.inputs.terraform_action != 'destroy' &&
-          (env.PLAN_EXIT_CODE == '2' || env.PLAN_EXIT_CODE == '0')
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         run: |
-          # Extract outputs from terraform
-          
-          # Try to get cluster name output, with fallback
+          # Extract the cluster name from terraform output
           CLUSTER_NAME=$(terraform output -raw eks_cluster_name 2>/dev/null || echo "neo4j-demo-cluster")
           
           # Save cluster name to SSM Parameter Store
@@ -166,7 +87,7 @@ jobs:
           
           # Save other important outputs if available
           VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || echo "")
-          if [ -n "$VPC_ID" ]; then
+          if [ ! -z "$VPC_ID" ]; then
             aws ssm put-parameter \
               --name "/neo4j-demos/${{ env.DEPLOY_ENV }}/vpc-id" \
               --value "$VPC_ID" \
