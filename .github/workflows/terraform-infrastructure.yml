@@ -62,18 +62,21 @@ jobs:
           terraform init
           terraform apply -auto-approve -var="environment=${{ env.DEPLOY_ENV }}" -var="project_name=${{ env.PROJECT_NAME }}" -var="aws_region=${{ secrets.AWS_REGION || 'us-west-2' }}"
           
-          # Save the outputs for main terraform
-          echo "TF_STATE_BUCKET=$(terraform output -raw state_bucket_name)" >> $GITHUB_ENV
-          echo "TF_LOCK_TABLE=$(terraform output -raw dynamodb_table_name)" >> $GITHUB_ENV
+          # Save the outputs for main terraform - fixed to properly capture just the values
+          STATE_BUCKET=$(terraform output -raw state_bucket_name)
+          LOCK_TABLE=$(terraform output -raw dynamodb_table_name)
+          
+          echo "TF_STATE_BUCKET=$STATE_BUCKET" >> $GITHUB_ENV
+          echo "TF_LOCK_TABLE=$LOCK_TABLE" >> $GITHUB_ENV
 
-      - name: Update Main Terraform Backend Config
-        working-directory: Terraform
-        run: |
-          # Update the terraform block to use S3 backend
-          if ! grep -q "backend \"s3\"" main.tf; then
-            # Add backend config if it doesn't exist
-            awk '/terraform {/,/}/{if(!/}/)print; else print "  backend \"s3\" {}\n}"; next}1' main.tf > tmp.tf && mv tmp.tf main.tf
-          fi
+            - name: Update Main Terraform Backend Config
+              working-directory: Terraform
+              run: |
+                # Update the terraform block to use S3 backend
+                if ! grep -q "backend \"s3\"" main.tf; then
+                  # Add backend config if it doesn't exist
+                  awk '/terraform {/,/}/{if(!/}/)print; else print "  backend \"s3\" {}\n}"; next}1' main.tf > tmp.tf && mv tmp.tf main.tf
+                fi
 
       - name: Terraform Init
         working-directory: Terraform
