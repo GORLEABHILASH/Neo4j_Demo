@@ -1,0 +1,42 @@
+name: Terraform Bootstrap
+
+on:
+  push:
+    paths:
+      - 'bootstrap/**'
+  workflow_dispatch:
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-west-2' }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Terraform Init & Apply
+        working-directory: bootstrap
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+          # Extract backend values and store in GitHub environment or SSM
+          BUCKET_NAME=$(terraform output -raw state_bucket_name)
+          TABLE_NAME=$(terraform output -raw dynamodb_table_name)
+
+          echo "TF_STATE_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
+          echo "TF_LOCK_TABLE=$TABLE_NAME" >> $GITHUB_ENV
+
+      - name: Store Outputs in SSM
+        run: |
+          aws ssm put-parameter --name "/terraform/state_bucket" --value "$TF_STATE_BUCKET" --type "String" --overwrite
+          aws ssm put-parameter --name "/terraform/lock_table" --value "$TF_LOCK_TABLE" --type "String" --overwrite
