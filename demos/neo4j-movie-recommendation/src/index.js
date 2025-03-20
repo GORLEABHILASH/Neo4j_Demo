@@ -30,88 +30,8 @@ app.get('/health', (req, res) => {
 // Replace the existing app.get('/') route with this code
 import { runQuery } from './neo4j.js';
 
-// Add this function to fetch data for the dashboard
-async function getDashboardData() {
-  try {
-    // Get genre counts
-    const genreResult = await runQuery(`
-      MATCH (g:Genre)<-[:IN_GENRE]-(m:Movie)
-      RETURN g.name AS genre, COUNT(m) AS movieCount
-      ORDER BY movieCount DESC
-      LIMIT 6
-    `);
-    
-    const genres = genreResult.records.map(record => ({
-      name: record.get('genre'),
-      count: record.get('movieCount').toNumber()
-    }));
-    
-    // Get latest movies
-    const latestMoviesResult = await runQuery(`
-      MATCH (m:Movie)
-      RETURN m.title AS title, m.released AS released, m.poster_image AS posterImage, m.tagline AS tagline
-      ORDER BY m.released DESC
-      LIMIT 6
-    `);
-    
-    const latestMovies = latestMoviesResult.records.map(record => ({
-      title: record.get('title'),
-      released: record.get('released'),
-      posterImage: record.get('posterImage'),
-      tagline: record.get('tagline')
-    }));
-    
-    // Get actor counts
-    const actorResult = await runQuery(`
-      MATCH (p:Person)-[:ACTED_IN]->(m:Movie)
-      WITH p, COUNT(m) AS movieCount
-      RETURN p.name AS name, p.profile_image AS profileImage, movieCount
-      ORDER BY movieCount DESC
-      LIMIT 6
-    `);
-    
-    const topActors = actorResult.records.map(record => ({
-      name: record.get('name'),
-      profileImage: record.get('profileImage'),
-      movieCount: record.get('movieCount').toNumber()
-    }));
-    
-    // Get total counts for dashboard stats
-    const countResult = await runQuery(`
-      MATCH (m:Movie)
-      WITH COUNT(m) AS movieCount
-      MATCH (p:Person)
-      WITH movieCount, COUNT(p) AS personCount
-      MATCH (g:Genre)
-      RETURN movieCount, personCount, COUNT(g) AS genreCount
-    `);
-    
-    const counts = {
-      movies: countResult.records[0].get('movieCount').toNumber(),
-      people: countResult.records[0].get('personCount').toNumber(),
-      genres: countResult.records[0].get('genreCount').toNumber()
-    };
-    
-    return {
-      genres,
-      latestMovies,
-      topActors,
-      counts
-    };
-  } catch (error) {
-    console.error('Error fetching dashboard data:', error);
-    return {
-      genres: [],
-      latestMovies: [],
-      topActors: [],
-      counts: { movies: 0, people: 0, genres: 0 }
-    };
-  }
-}
 
-// Update the route handler for the landing page
-// Replace the existing app.get('/') route with this code
-// Make sure to place this code correctly in your index.js file
+
 
 // Add this function to fetch data for the dashboard
 async function getDashboardData() {
