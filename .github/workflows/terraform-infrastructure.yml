@@ -6,12 +6,14 @@ on:
       - main
     paths:
       - 'Terraform/**'
+      - 'bootstrap/**'
       - '.github/workflows/terraform-infrastructure.yml'
   pull_request:
     branches:
       - main
     paths:
       - 'Terraform/**'
+      - 'bootstrap/**'
   workflow_dispatch:
     inputs:
       environment:
@@ -53,17 +55,43 @@ jobs:
           echo "TF_VAR_environment=$DEPLOY_ENV" >> $GITHUB_ENV
           echo "PROJECT_NAME=neo4j-demos" >> $GITHUB_ENV
 
-      # Skip bootstrap step since we're using pre-configured bucket and table names
-      
+      - name: Bootstrap Terraform State
+        working-directory: bootstrap
+        run: |
+          # Initialize and apply Terraform
+          terraform init
+          terraform apply -auto-approve \
+            -var="environment=${{ env.DEPLOY_ENV }}" \
+            -var="project_name=${{ env.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION || 'us-west-2' }}"
+          
+          # Extract values directly from the terraform output command
+          # This helps avoid issues with GitHub Actions debug info
+          terraform output > tf_output.txt
+          
+          # Use grep to extract just the values from the output file
+          BUCKET_NAME=$(grep "state_bucket_name" tf_output.txt | sed -E 's/state_bucket_name += +"([^"]+)"/\1/')
+          TABLE_NAME=$(grep "dynamodb_table_name" tf_output.txt | sed -E 's/dynamodb_table_name += +"([^"]+)"/\1/')
+          
+          # Display extracted values
+          echo "Using S3 bucket: $BUCKET_NAME"
+          echo "Using DynamoDB table: $TABLE_NAME"
+          
+          # Set environment variables for later steps
+          echo "TF_STATE_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
+          echo "TF_LOCK_TABLE=$TABLE_NAME" >> $GITHUB_ENV
+         
       - name: Terraform Init
         working-directory: Terraform
         run: |
-          # Use the environment-specific secrets
+          echo "Using S3 bucket: $TF_STATE_BUCKET"
+          echo "Using DynamoDB table: $TF_LOCK_TABLE"
+      
           terraform init \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
             -backend-config="key=${{ env.DEPLOY_ENV }}/terraform.tfstate" \
             -backend-config="region=${{ secrets.AWS_REGION || 'us-west-2' }}" \
-            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+            -backend-config="dynamodb_table=$TF_LOCK_TABLE"
       
       - name: Terraform Format
         working-directory: Terraform
